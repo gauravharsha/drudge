@@ -1,13 +1,17 @@
 """Tests for user utility functions."""
 
+import functools
 import time
 import types
 from unittest.mock import MagicMock
 
-from sympy import IndexedBase, symbols
+from sympy import IndexedBase, symbols, Symbol
 
-from drudge import Vec, sum_, prod_, Stopwatch, ScalarLatexPrinter
-from drudge.term import parse_terms
+from drudge import (
+    Vec, sum_, prod_, Stopwatch, ScalarLatexPrinter, InvariantIndexable, Range
+)
+from drudge.term import parse_terms, try_resolve_range
+from drudge.utils import extract_alnum, SymbResolver
 
 
 def test_sum_prod_utility():
@@ -53,6 +57,15 @@ def test_stopwatch():
     assert float(res.split()[-2]) - 1.0 < 0.1
 
 
+def test_invariant_indexable():
+    """Test the utility for invariant indexables."""
+
+    val = Symbol('G')
+    tensor = InvariantIndexable(val)
+    assert tensor[1] == val
+    assert tensor[1, Symbol('i')] == val
+
+
 def test_scalar_latex_printing():
     """Test the printing of scalars into LaTeX form."""
 
@@ -60,3 +73,30 @@ def test_scalar_latex_printing():
     i, j = symbols('i j')
     expr = x1[i, j]
     assert ScalarLatexPrinter().doprint(expr) == 'x^{(1)}_{i,j}'
+
+
+def test_extracting_alnum_substring():
+    """Test the utility to extract alphanumeric part of a string."""
+    assert extract_alnum('x_{1, 2}') == 'x12'
+
+
+def test_symb_resolvers():
+    """Test the functionality of symbol resolvers in strict mode."""
+    r = Range('R')
+    a, b = symbols('a b')
+
+    strict, normal = [functools.partial(
+        try_resolve_range, sums_dict={}, resolvers=[SymbResolver(
+            [(r, [a])], strict=i
+        )]
+    ) for i in [True, False]]
+
+    # Strict mode.
+    assert strict(a) == r
+    assert strict(b) is None
+    assert strict(a + 1) is None
+
+    # Normal mode.
+    assert normal(a) == r
+    assert normal(b) is None
+    assert normal(a + 1) == r

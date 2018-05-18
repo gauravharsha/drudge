@@ -7,6 +7,8 @@ import inspect
 
 from sympy import Symbol, Indexed, IndexedBase
 
+from .term import ATerms
+
 
 #
 # Special classes for SymPy objects
@@ -103,9 +105,20 @@ class DrsSymbol(_Definable, Symbol):
         else:
             target = args[0]
             rest = args[1:]
+
             err = NameError('Invalid method', name, 'for', str(type(target)))
             if not hasattr(target, name):
-                raise err
+                # It is possible that a tensor method is tried to be called on
+                # an input.
+                if isinstance(target, ATerms):
+                    tensor = self._drudge.sum(target)
+                    if hasattr(tensor, name):
+                        target = tensor
+                    else:
+                        raise err
+                else:
+                    raise err
+
             meth = getattr(target, name)
             if inspect.ismethod(meth):
                 # It has a caveat that static methods might not be able to be
@@ -299,28 +312,30 @@ class DrsEnv(dict):
         super().__init__()
 
         self._drudge = dr
-        path = [dr.names]
+        path = [(dr.names, frozenset())]
         self._path = path
 
         if specials is not None:
-            path.append(specials)
+            path.append((specials, frozenset()))
 
-        path.append(dr)
+        path.append((dr, frozenset()))
         import drudge
-        path.append(drudge)
+        path.append((drudge, frozenset()))
 
         try:
             import gristmill
         except ModuleNotFoundError:
             pass
         else:
-            path.append(gristmill)
+            path.append((gristmill, frozenset()))
 
         import sympy
-        path.append(sympy)
+        path.append((sympy, frozenset([
+            'N'
+        ])))
 
         import builtins
-        path.append(builtins)
+        path.append((builtins, frozenset()))
 
     def __missing__(self, key: str):
         """Get the missing name.
@@ -332,9 +347,9 @@ class DrsEnv(dict):
         if key.startswith('__') and key.endswith('__'):
             raise KeyError(key)
 
-        for i in self._path:
-            if hasattr(i, key):
-                resolv = getattr(i, key)
+        for entry, excl in self._path:
+            if hasattr(entry, key) and key not in excl:
+                resolv = getattr(entry, key)
                 break
             else:
                 continue

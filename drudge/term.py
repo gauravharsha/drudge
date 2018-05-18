@@ -5,19 +5,21 @@ import collections
 import functools
 import itertools
 import operator
+import types
 import typing
 import warnings
 from collections.abc import Iterable, Mapping, Callable, Sequence
 
 from sympy import (
-    sympify, Symbol, KroneckerDelta, Eq, solve, S, Integer, Add, Mul, Indexed,
-    IndexedBase, Expr, Basic, Pow, Wild, conjugate
+    sympify, Symbol, KroneckerDelta, Eq, solveset, S, Integer, Add, Mul, Number,
+    Indexed, IndexedBase, Expr, Basic, Pow, Wild, conjugate, Sum, Piecewise,
+    Intersection, expand_power_base, expand_power_exp
 )
 from sympy.core.sympify import CantSympify
 
 from .canon import canon_factors
 from .utils import (
-    ensure_symb, ensure_expr, sympy_key, is_higher, NonsympifiableFunc
+    ensure_symb, ensure_expr, sympy_key, is_higher, NonsympifiableFunc, prod_
 )
 
 #
@@ -50,9 +52,11 @@ class Range:
 
     .. warning::
 
-        Bounds with the same label but different bounds will be considered
-        unequal.  Although no error be given, using different bounds with
-        identical label is strongly advised against.
+        Equality comparison and hashing of ranges are *completely* based on the
+        label, without consideration of the bounds.  So ranges with the same
+        label but different bounds will be considered equal.  This is to
+        facilitate the usage of a same dummy set for ranges with slight
+        variation in the bounds.
 
     .. warning::
 
@@ -134,13 +138,13 @@ class Range:
     def __hash__(self):
         """Hash the symbolic range.
         """
-        return hash(self.args)
+        return hash(self._label)
 
     def __eq__(self, other):
         """Compare equality of two ranges.
         """
         return isinstance(other, type(self)) and (
-            self.args == other.args
+                self._label == other.label
         )
 
     def __repr__(self):
@@ -182,6 +186,31 @@ class Range:
             raise TypeError('Invalid range to compare', other)
 
         return self.sort_key < other.sort_key
+
+    def __getitem__(self, item):
+        """Get a new range with explicit bounds set.
+
+        This can be used on both symbolic range to give them explicit bounds,
+        and on bounded range to set new bounds for them.
+        """
+        if not isinstance(item, tuple) or len(item) != 2:
+            raise TypeError(
+                'Invalid bounds for range, expecting upper and lower range',
+                item
+            )
+
+        lower, upper = [sympify(i) for i in item]
+        return Range(self._label, lower=lower, upper=upper)
+
+    def map(self, func):
+        """Map the given function to the bounds of the range.
+
+        For ranges without bounds, the same range is simply returned.
+        """
+        if self.bounded:
+            return self[func(self.lower), func(self.upper)]
+        else:
+            return self
 
 
 class ATerms(abc.ABC):
@@ -302,6 +331,19 @@ class ATerms(abc.ABC):
     def __rtruediv__(self, other):
         """Being divided over by other object."""
         raise NotImplementedError('General tensors cannot inversed')
+
+    def __or__(self, other):
+        """Compute the commutator with another object.
+        """
+        if is_higher(other, self._op_priority):
+            return NotImplemented
+        return self * other - other * self
+
+    def __ror__(self, other):
+        """Compute the commutator with another object on the right."""
+        if is_higher(other, self._op_priority):
+            return NotImplemented
+        return other * self - self * other
 
 
 class Terms(ATerms):
@@ -433,8 +475,9 @@ class Vec(ATerms, CantSympify):
     def __eq__(self, other):
         """Compares the equality of two vectors."""
         return (
-            (isinstance(self, type(other)) or isinstance(other, type(self))) and
-            self._label == other.label and self._indices == other.indices
+                (isinstance(self, type(other)) or
+                 isinstance(other, type(self))) and
+                self._label == other.label and self._indices == other.indices
         )
 
     @property
@@ -652,10 +695,17 @@ class Term(ATerms):
 
         Note that the summation dummies are not looped over.
         """
+        for _, range_ in self._sums:
+            if range_.bounded:
+                yield range_.lower
+                yield range_.upper
+            continue
 
         yield self._amp
+
         for vec in self._vecs:
             yield from vec.indices
+            continue
 
     @property
     def free_vars(self):
@@ -687,22 +737,24 @@ class Term(ATerms):
         case of no special additional symbols.
         """
 
-        return self.get_amp_factors(set())
+        return self.get_amp_factors()
 
-    def get_amp_factors(self, *special_symbs):
+    def get_amp_factors(self, *special_symbs, monom_only=True):
         """Get the factors in the amplitude and the coefficient.
 
         The indexed factors and factors involving dummies or the symbols in the
         given special symbols set will be returned as a list, with the rest
         returned as a single SymPy expression.
 
-        Error will be raised if the amplitude is not a monomial.
+        When ``monom_only`` is set, Error will be raised if the amplitude is not
+        a monomial.
         """
 
         amp = self._amp
 
-        if isinstance(amp, Add):
+        if monom_only and isinstance(amp, Add):
             raise ValueError('Invalid amplitude: ', amp, 'expecting monomial')
+
         if isinstance(amp, Mul):
             all_factors = amp.args
         else:
@@ -727,7 +779,7 @@ class Term(ATerms):
 
     def map(
             self, func=lambda x: x, sums=None, amp=None, vecs=None,
-            skip_vecs=False
+            skip_vecs=False, skip_ranges=False
     ):
         """Map the given function to the SymPy expressions in the term.
 
@@ -740,14 +792,19 @@ class Term(ATerms):
         vector part.
         """
 
-        return Term(
-            self._sums if sums is None else sums,
-            func(self._amp if amp is None else amp),
-            tuple(
-                i.map(func) if not skip_vecs else i
-                for i in (self._vecs if vecs is None else vecs)
+        res_sums = self._sums if sums is None else sums
+        if not skip_ranges:
+            res_sums = tuple(
+                (dumm, range_.map(func)) for dumm, range_ in res_sums
             )
-        )
+
+        res_amp = func(self._amp if amp is None else amp)
+
+        res_vecs = self._vecs if vecs is None else vecs
+        if not skip_vecs:
+            res_vecs = tuple(i.map(func) for i in res_vecs)
+
+        return Term(res_sums, res_amp, res_vecs)
 
     def subst(self, substs, sums=None, amp=None, vecs=None, purge_sums=False):
         """Perform symbol substitution on the SymPy expressions.
@@ -766,7 +823,8 @@ class Term(ATerms):
             sums = tuple(i for i in sums if i[0] not in substs)
 
         return self.map(
-            lambda x: x.xreplace(substs), sums=sums, amp=amp, vecs=vecs
+            lambda x: x.xreplace(substs), sums=sums, amp=amp, vecs=vecs,
+            skip_ranges=False
         )
 
     def reset_dumms(self, dumms, dummbegs=None, excl=None, add_substs=None):
@@ -846,8 +904,12 @@ class Term(ATerms):
         # Note that here the substitutions needs to be performed in order.
         return self.subst(substs, purge_sums=True, amp=new_amp)
 
-    def simplify_sums(self):
-        """Simplify the summations in the term."""
+    def simplify_trivial_sums(self):
+        """Simplify the trivial summations in the term.
+
+        Trivial summations are the concrete summations that do not have any
+        involvement at all.
+        """
 
         involved = {
             i for expr in self.exprs for i in expr.atoms(Symbol)
@@ -899,6 +961,9 @@ class Term(ATerms):
         are never permuted in the result.
         """
 
+        if symms is None:
+            symms = {}
+
         # Factors to canonicalize.
         factors = []
 
@@ -917,43 +982,65 @@ class Term(ATerms):
 
         # Cache globals for performance.
         wrapper_base = _WRAPPER_BASE
-        indexed_placeholder = _INDEXED_PLACEHOLDER
+        treated_placeholder = _TREATED_PLACEHOLDER
 
-        # Extractors for the indexed, defined here to avoid repeated list and
-        # function creation for each factor.
-        indexed = []
+        # Extractors for subexpressions requiring explicit treatment, defined
+        # here to avoid repeated list and function creation for each factor.
+        to_treats = []
 
-        def replace_indexed(base, *indices):
-            """Replace the indexed quantity inside the factor."""
-            indexed.append(base[indices])
-            return indexed_placeholder
+        def replace_to_treats(expr: Expr):
+            """Replace the quantities need treatment inside the factor.
+
+            These quantities are explicitly indexed quantities and multi-valence
+            functions either with explicit symmetry given or with multiple
+            arguments involving dummies.
+            """
+
+            if_treat = False
+            if expr.func == Indexed:
+                if_treat = True
+            elif len(expr.args) > 1:
+                if expr.func in symms or (expr.func, len(expr.args)) in symms:
+                    if_treat = True
+                else:
+                    if_treat = sum(1 for arg in expr.args if any(
+                        arg.has(dumm) for dumm, _ in self.sums
+                    )) > 1
+
+            if if_treat:
+                to_treats.append(expr)
+                return treated_placeholder
+            else:
+                return expr
 
         amp_factors, coeff = self.amp_factors
         for i in amp_factors:
 
-            amp_no_indexed = i.replace(
-                Indexed, NonsympifiableFunc(replace_indexed)
+            amp_no_treated = i.replace(
+                lambda _: True, NonsympifiableFunc(replace_to_treats)
             )
 
-            n_indexed = len(indexed)
-            if n_indexed > 1:
+            n_to_treats = len(to_treats)
+            if n_to_treats > 1:
                 raise ValueError(
-                    'Invalid amplitude factor containing multiple indexed', i
+                    'Overly complex factor', i
                 )
-            elif n_indexed == 1:
+            elif n_to_treats == 1:
+                to_treat = to_treats[0]
+                to_treats.clear()  # Clean the container for the next factor.
 
                 factors.append((
-                    indexed[0], (
+                    to_treat, (
                         _COMMUTATIVE,
-                        indexed[0].base.label.name,
-                        sympy_key(amp_no_indexed)
+                        sympy_key(to_treat.base.label)
+                        if isinstance(to_treat, Indexed)
+                        else sympy_key(to_treat.func),
+                        sympy_key(amp_no_treated)
                     )
                 ))
-                factors_info.append(amp_no_indexed)
+                factors_info.append(amp_no_treated)
 
-                indexed.clear()  # Clean the container for the next factor.
-
-            else:  # No indexed.
+            else:  # No part needing explicit treatment.
 
                 # When the factor never has an indexed base, we treat it as
                 # indexing a uni-valence internal indexed base.
@@ -983,7 +1070,7 @@ class Term(ATerms):
         #
 
         res_sums, canoned_factors, canon_coeff = canon_factors(
-            self._sums, factors, symms if symms is not None else {}
+            self._sums, factors, symms
         )
 
         #
@@ -1000,7 +1087,7 @@ class Term(ATerms):
             elif j == unindexed_factor:
                 res_amp *= i.indices[0]
             else:
-                res_amp *= j.xreplace({indexed_placeholder: i})
+                res_amp *= j.xreplace({treated_placeholder: i})
             continue
 
         return Term(tuple(res_sums), res_amp, tuple(res_vecs))
@@ -1046,7 +1133,7 @@ class Term(ATerms):
 _WRAPPER_BASE = IndexedBase(
     'internalWrapper', shape=('internalShape',)
 )
-_INDEXED_PLACEHOLDER = Symbol('internalIndexedPlaceholder')
+_TREATED_PLACEHOLDER = Symbol('internalTreatedPlaceholder')
 
 # For colour of factors in a term.
 
@@ -1059,22 +1146,34 @@ _NON_COMMUTATIVE = 0
 # ---------------------------------
 #
 
-def subst_vec_in_term(term: Term, lhs: Vec, rhs_terms: typing.List[Term],
-                      dumms, dummbegs, excl):
+def subst_vec_term(
+        term: Term, lhs: typing.Tuple[Vec], rhs_terms: typing.List[Term],
+        dumms, dummbegs, excl
+):
     """Substitute a matching vector in the given term.
     """
 
     sums = term.sums
     vecs = term.vecs
     amp = term.amp
+    n_new_vecs = len(lhs)
 
-    for i, v in enumerate(vecs):
-        substs = _match_indices(v, lhs)
-        if substs is None:
-            continue
+    for i in range(len(vecs) - n_new_vecs + 1):
+        substs = {}
+
+        # Here we do simple hay-needle, KMP can be very hard here because of the
+        # complexity of the predicate.
+        for target, pattern in zip(vecs[i:], lhs):
+            new = _match_indices(target, pattern)
+            if new is None or not _update_substs(substs, new):
+                break
+            else:
+                continue
         else:
-            substed_vec_idx = i
+            start_idx = i
             break
+
+        continue
     else:
         return None  # Based on nest bind protocol.
 
@@ -1085,7 +1184,7 @@ def subst_vec_in_term(term: Term, lhs: Vec, rhs_terms: typing.List[Term],
     res = []
     for i, j in subst_states:
         new_vecs = list(vecs)
-        new_vecs[substed_vec_idx:substed_vec_idx + 1] = i.vecs
+        new_vecs[start_idx:start_idx + n_new_vecs] = i.vecs
         res.append((
             Term(sums + i.sums, amp * i.amp, tuple(new_vecs)), j
         ))
@@ -1094,8 +1193,10 @@ def subst_vec_in_term(term: Term, lhs: Vec, rhs_terms: typing.List[Term],
     return res
 
 
-def subst_factor_in_term(term: Term, lhs, rhs_terms: typing.List[Term],
-                         dumms, dummbegs, excl, full_simplify=True):
+def subst_factor_term(
+        term: Term, lhs, rhs_terms: typing.List[Term], dumms, dummbegs, excl,
+        full_simplify=True
+):
     """Substitute a scalar factor in the term.
 
     While vectors are always flattened lists of vectors.  The amplitude part can
@@ -1224,10 +1325,28 @@ def _match_indices(target, expr):
         if res is None:
             return None
         else:
-            substs.update(res)
+            if not _update_substs(substs, res):
+                return None
             continue
 
     return substs
+
+
+def _update_substs(substs, new):
+    """Update the substitutions dictionary.
+
+    If any of the new entry is in conflict with the old entry, a false will be
+    returned, or we got true.
+    """
+
+    for k, v in new.items():
+        if k not in substs:
+            substs[k] = v
+        elif v != substs[k]:
+            return False
+        continue
+
+    return True
 
 
 def _prepare_subst_states(rhs_terms, substs, dumms, dummbegs, excl):
@@ -1294,6 +1413,88 @@ def rewrite_term(
         )
 
     return None, term
+
+
+Sum_expander = typing.Callable[[Symbol], typing.Iterable[typing.Tuple[
+    Symbol, Range, Expr
+]]]
+
+
+def expand_sums_term(
+        term: Term, range_: Range, expander: Sum_expander,
+        exts=None, conv_accs=None
+):
+    """Expand the given summations in the term.
+    """
+
+    res_sums = []
+
+    # Pairs, symbol/if a summation dummy.
+    dumms_to_expand = []
+    if exts:
+        dumms_to_expand.extend((i, False) for i in exts)
+
+    for i in term.sums:
+        if i[1] == range_:
+            dumms_to_expand.append((i[0], True))
+        else:
+            res_sums.append(i)
+        continue
+
+    repl = {}
+    first_new = {}
+    for dumm, is_sum in dumms_to_expand:
+        first_new_added = False
+        for new_dumm, new_range, prev_form in expander(dumm):
+            # Cleanse results from user callback.
+            if not isinstance(new_dumm, Symbol):
+                raise TypeError(
+                    'Invalid dummy for the new summation', new_dumm
+                )
+            if not isinstance(new_range, Range):
+                raise TypeError(
+                    'Invalid range for the new summation', new_range
+                )
+            if not isinstance(prev_form, Expr):
+                raise TypeError(
+                    'Invalid previous form of the new summation dummy',
+                    prev_form
+                )
+
+            if is_sum:
+                res_sums.append((new_dumm, new_range))
+
+            repl[prev_form] = new_dumm
+            if not first_new_added:
+                first_new[dumm] = new_dumm
+                first_new_added = True
+            continue
+        continue
+
+    if conv_accs:
+        for k, v in first_new.items():
+            for i in conv_accs:
+                repl[i(k)] = i(v)
+                continue
+            continue
+
+    res_term = term.map(
+        lambda x: x.xreplace(repl), sums=tuple(res_sums), skip_ranges=False
+    )
+
+    def check_expr(expr: Expr):
+        """Check if the given expression still has the expanded dummies."""
+        for i in dumms_to_expand:
+            if expr.has(i):
+                raise ValueError(
+                    'Scalar', expr, 'with original dummy', i
+                )
+            continue
+        return expr
+
+    res_term.map(check_expr)  # Discard result.
+
+    return res_term
 
 
 #
@@ -1434,29 +1635,25 @@ def _cat_sums(sums1, sums2):
     return sums
 
 
-def einst_term(term: Term, resolvers):
+def einst_term(term: Term, resolvers) -> typing.Tuple[
+    typing.List[Term], typing.AbstractSet[Symbol]
+]:
     """Add summations according to the Einstein convention to a term.
 
-    In order for problems easy to be detected for users, here we just add the
-    most certain Einstein summations, while give warnings when there is anything
-    looking like a summation but is not added because of something suspicious.
+    The likely external indices for the term is also returned.
     """
 
-    # Strategy, find all indices to indexed bases, and replace them with
-    # placeholder symbols so that we can detect other free symbols in the
-    # amplitude as well.
+    # Gather all indices to the indexed quantities.
 
-    next_idx = [0]
     indices = []
 
-    def replace_cb(_, *curr_indices):
-        """Replace indexed quantities."""
-        indices.extend(curr_indices)
-        placeholder = Symbol('internalEinstPlaceholder{}'.format(next_idx[0]))
-        next_idx[0] += 1
-        return placeholder
+    def proc_indexed(*args):
+        """Get the indices to the indexed bases."""
+        assert len(args) > 1
+        indices.extend(args[1:])
+        return Indexed(*args)
 
-    res_amp = term.amp.replace(Indexed, NonsympifiableFunc(replace_cb))
+    term.amp.replace(Indexed, NonsympifiableFunc(proc_indexed))
     for i in term.vecs:
         indices.extend(i.indices)
 
@@ -1473,44 +1670,43 @@ def einst_term(term: Term, resolvers):
 
     existing_dumms = term.dumms
     new_sums = []
+    exts = set()
     for symb, use in use_tally.items():
 
         if symb in existing_dumms:
             continue
 
-        if use[0] != 2 and use[0] + use[1] != 2:
-            # No chance to be an Einstein summation.
-            continue
-
         if use[1] != 0:
-            warnings.warn(
-                'Symbol {} is not summed due to its usage in complex indices'
-                    .format(symb)
-            )
-            continue
-        if res_amp.has(symb):
-            warnings.warn(
-                'Symbol {} is not summed due to its usage in the amplitude'
-                    .format(symb)
-            )
+            # Non-conventional indices.
             continue
 
-        range_ = try_resolve_range(symb, {}, resolvers)
-        if range_ is None:
-            warnings.warn(
-                'Symbol {} is not summed for the incapability to resolve range'
-                    .format(symb)
-            )
-            continue
+        if use[0] == 1:
+            # External candidate.
+            exts.add(symb)
+        else:
+            # Summation candidate.
+            range_ = try_resolve_range(symb, {}, resolvers)
+            if range_ is None:
+                warnings.warn(
+                    'Symbol {} is not summed for the incapability to resolve '
+                    'range'
+                        .format(symb)
+                )
+                continue
 
-        # Now we have an Einstein summation.
-        new_sums.append((symb, range_))
+            # Now we have an Einstein summation.
+            new_sums.append((symb, range_))
         continue
 
     # Make summation from Einstein convention deterministic.
-    new_sums.sort(key=lambda x: (x[1].sort_key, x[0].name))
+    new_sums.sort(key=lambda x: (
+        tuple(i.sort_key for i in (
+            [x[1]] if isinstance(x[1], Range) else x[1]
+        )),
+        x[0].name
+    ))
 
-    return Term(_cat_sums(term.sums, new_sums), term.amp, term.vecs)
+    return sum_term(new_sums, term), exts
 
 
 def parse_term(term):
@@ -1546,13 +1742,26 @@ def simplify_deltas_in_expr(sums_dict, amp, resolvers):
 
     substs = {}
 
-    if amp == 0:
+    if amp == 0 or isinstance(amp, Add):
+        # For zero, no need for processing.  For polynomials, it cannot proceed,
+        # since the rest of simplification assumed monomial.
         return amp, substs
+
+    # Preprocess some expressions equivalent to deltas into explicit delta form.
+    arg0 = Wild('arg0')
+    arg1 = Wild('arg1')
+    value = Wild('value')
+    amp = amp.replace(
+        Piecewise((value, Eq(arg0, arg1)), (0, True)),
+        KroneckerDelta(arg0, arg1) * value
+    )
 
     new_amp = amp.replace(KroneckerDelta, NonsympifiableFunc(functools.partial(
         _proc_delta_in_amp, sums_dict, resolvers, substs
     )))
 
+    # Attempt some simple simplifications on simple unresolved deltas.
+    new_amp = _try_simpl_unresolved_deltas(new_amp)
     return new_amp, substs
 
 
@@ -1623,37 +1832,59 @@ def proc_delta(arg1, arg2, sums_dict, resolvers):
     ]
 
     if len(dumms) == 0:
-        return KroneckerDelta(arg1, arg2), None
+        range1 = try_resolve_range(arg1, sums_dict, resolvers)
+        range2 = try_resolve_range(arg2, sums_dict, resolvers)
+        if range1 is None or range2 is None or range1 == range2:
+            return KroneckerDelta(arg1, arg2), None
+        else:
+            return _NAUGHT, None
 
-    eqn = Eq(arg1, arg2)
+    eqn = Eq(arg1, arg2).simplify()
 
     # We try to solve for each of the dummies.  Most likely this will only be
     # executed for one loop.
 
     for dumm in dumms:
         range_ = sums_dict[dumm]
-        sol = solve(eqn, dumm)
+        # Here we assume the same integral domain, since dummies are summed over
+        # and we can mostly assume that they are integral.
+        #
+        # TODO: infer actual domain from the range.
+        domain = S.Integers
+        sol = solveset(eqn, dumm, domain)
 
-        if sol is S.true:
+        # Strip off trivial intersecting with the domain.
+        if isinstance(sol, Intersection) and len(sol.args) == 2:
+            if sol.args[0] == domain:
+                sol = sol.args[1]
+            elif sol.args[1] == domain:
+                sol = sol.args[0]
+
+        if sol == domain:
             # Now we can be sure that we got an identity.
             return _UNITY, None
-        elif len(sol) > 0:
-            for i in sol:
-                # Try to get the range of the substituting expression.
-                range_of_i = try_resolve_range(i, sums_dict, resolvers)
-                if range_of_i is None:
-                    continue
-                if range_of_i == range_:
-                    return _UNITY, (dumm, i)
-                else:
-                    # We assume atomic and disjoint ranges!
-                    return _NAUGHT, None
-            # We cannot resolve the range of any of the solutions.  Try next
-            # dummy.
-            continue
+        elif hasattr(sol, '__len__'):
+            # Concrete solutions.
+            if len(sol) > 0:
+                for i in sol:
+                    # Try to get the range of the substituting expression.
+                    range_of_i = try_resolve_range(i, sums_dict, resolvers)
+                    if range_of_i is None:
+                        continue
+                    if range_of_i == range_:
+                        return _UNITY, (dumm, i)
+                    else:
+                        # We assume atomic and disjoint ranges!
+                        return _NAUGHT, None
+                # We cannot resolve the range of any of the solutions.  Try next
+                # dummy.
+                continue
+            else:
+                # No solution.
+                return _NAUGHT, None
         else:
-            # No solution.
-            return _NAUGHT, None
+            # Undecipherable solutions.
+            continue
 
     # When we got here, all the solutions we found have undetermined range, we
     # have to return the unprocessed form.
@@ -1680,6 +1911,245 @@ def _proc_delta_in_amp(sums_dict, resolvers, substs, *args):
     )
 
     return new_amp
+
+
+def _try_simpl_unresolved_deltas(amp: Expr):
+    """Try some simplification on unresolved deltas.
+
+    This function aims to normalize the usage of free indices in the amplitude
+    when a delta factor is present to require their equality.
+
+    TODO: Unify the treatment here and the treatment for summation dummies.
+    """
+
+    if not isinstance(amp, Mul):
+        return amp
+
+    substs = {}
+    deltas = _UNITY
+    others = _UNITY
+    for i in amp.args:
+        if isinstance(i, KroneckerDelta):
+            arg1, arg2 = i.args
+
+            # Here, only the simplest case is treated, a * x = b * y, with a, b
+            # being numbers and x, y being atomic symbols.  One of the symbols
+            # can be missing.  But not both, since SymPy will automatically
+            # resolve a delta between two numbers.
+
+            factor1, symb1 = _parse_factor_symb(arg1)
+            factor2, symb2 = _parse_factor_symb(arg2)
+            if factor1 is not None and factor2 is not None:
+                if symb1 is None:
+                    assert symb2 is not None
+                    arg1 = symb2
+                    arg2 = factor1 / factor2
+                elif symb2 is None:
+                    assert symb1 is not None
+                    arg1 = symb1
+                    arg2 = factor2 / factor1
+                elif sympy_key(symb1) < sympy_key(symb2):
+                    arg1 = symb2
+                    arg2 = factor1 * symb1 / factor2
+                else:
+                    arg1 = symb1
+                    arg2 = factor2 * symb2 / factor1
+                substs[arg1] = arg2
+            deltas *= KroneckerDelta(arg1, arg2)
+        else:
+            others *= i
+
+    return deltas * others.xreplace(substs)
+
+
+def _parse_factor_symb(expr: Expr):
+    """Parse a number times a symbol.
+
+    When the expression is of that form, that number and the only symbol is
+    returned.  For plain numbers, the symbol part is none.  For completely
+    non-compliant expressions, a pair of none is going to be returned.
+    """
+
+    if isinstance(expr, Symbol):
+        return _UNITY, expr
+    elif isinstance(expr, Number):
+        return expr, None
+    elif isinstance(expr, Mul):
+        factor = _UNITY
+        symb = None
+        for i in expr.args:
+            if isinstance(i, Number):
+                factor *= i
+            elif isinstance(i, Symbol):
+                if symb is None:
+                    symb = i
+                else:
+                    return None, None
+            else:
+                return None, None
+        return factor, symb
+    else:
+        return None, None
+
+
+#
+# Amplitude summation simplification
+# ----------------------------------
+#
+
+
+def simplify_amp_sums_term(term: Term, simplifiers, excl_bases, resolvers):
+    """Attempt to make simplifications to summations internal in amplitudes.
+
+    This function has a complex appearance, but it basically just tries to apply
+    the rules repeatedly until it can be guaranteed that none of the rules is
+    applicable to the current term.
+    """
+
+    simplifiers = simplifiers.value
+    resolvers = resolvers.value
+    sums_dict = dict(term.sums)
+
+    # Do some pre-processing for better handling of the factors.
+    term = term.map(lambda x: expand_power_base(expand_power_exp(x)))
+
+    all_factors, coeff = term.get_amp_factors()
+    if isinstance(coeff, Mul):
+        all_factors.extend(coeff.args)
+    else:
+        all_factors.append(coeff)
+
+    # Factor: pair of the expression and the cached set of its symbols.
+    factors = []
+    res_amp = 1  # Amplitude of the result to be incrementally built.
+    imposs_symbs = set()  # Any symbol here will not be attempted.
+    for factor in all_factors:
+        symbs = factor.atoms(Symbol)
+        if len(symbs) == 0:
+            res_amp *= factor
+            continue
+        if excl_bases and isinstance(factor, Indexed):
+            imposs_symbs |= symbs
+            res_amp *= factor
+            continue
+        factors.append((factor, symbs))
+        continue
+
+    for vec in term.vecs:
+        for i in vec.indices:
+            imposs_symbs |= i.atoms(Symbol)
+            continue
+        continue
+
+    # Summations in the result to be incrementally built.
+    res_sums = []
+
+    # Summations to process, mapping from the dummy to information about it,
+    # including the list of factors involving it, the original range, and the
+    # SymPy-style triple range.  The factors list may need to be updated after a
+    # simplification, which may add or remove factors.
+    to_proc = {}
+
+    for sum_ in term.sums:
+        dumm, range_ = sum_
+        if dumm in imposs_symbs or not range_.bounded:
+            # Summations not intended to be treated here.
+            res_sums.append(sum_)
+            continue
+
+        involving_factors = [
+            i for i in factors if dumm in i[1]
+        ]
+
+        # Trivial summations leaked here must have involvement in other sum
+        # bounds.
+        if len(involving_factors) == 0:
+            res_sums.append(sum_)
+        else:
+            to_proc[dumm] = types.SimpleNamespace(
+                factors=involving_factors, range=range_,
+                triple=(dumm, range_.lower, range_.upper - 1)
+            )
+
+        # TODO: Make simplification considering dummies' involvement in the
+        # summation bounds as well.
+        continue
+
+    # Main loop, apply the rules until none of them can be applied.
+    has_simplified = True
+    while has_simplified:
+
+        has_simplified = False  # Toppled to true only after simplification.
+
+        # Apply the rules in increasing order of their complexity.  Simpler
+        # rules are attempted first.
+        for n_sums in sorted(simplifiers.keys()):
+            n_to_proc = len(to_proc)
+            if n_sums > n_to_proc:
+                break
+
+            for sums in itertools.combinations(to_proc.keys(), n_sums):
+                curr_infos = [to_proc[i] for i in sums]
+                curr_sums = [i.triple for i in curr_infos]
+                # Factors come and go, here they are tracked by their address.
+                curr_factors = {
+                    id(j): j
+                    for i in curr_infos for j in i.factors
+                }
+                curr_expr = prod_(i[0] for i in curr_factors.values())
+
+                orig = Sum(curr_expr, *curr_sums)
+                for simplify in simplifiers[n_sums]:
+
+                    # Call user-provided simplifier.
+                    simplified = simplify(
+                        orig, resolvers=resolvers, sums_dict=sums_dict
+                    )
+
+                    if_simplified = (
+                            simplified is not None and simplified != orig and
+                            not isinstance(simplified, Sum)
+                    )
+                    if not if_simplified:
+                        continue
+
+                    # Whe simplification happens.
+                    new_factors = [
+                        i for i in factors if id(i) not in curr_factors
+                    ]
+                    for i in (
+                            simplified.args if isinstance(simplified, Mul)
+                            else (simplified,)
+                    ):
+                        new_factors.append((
+                            i, i.atoms(Symbol)
+                        ))
+                        continue
+                    factors = new_factors
+
+                    for i in sums:
+                        del to_proc[i]
+                    for k, v in to_proc.items():
+                        v.factors = [
+                            i for i in factors if k in i[1]
+                        ]
+                    has_simplified = True
+                    break
+
+                # When simplification is done, try to rewind.
+                if has_simplified:
+                    break
+            if has_simplified:
+                break
+
+    # Place the unprocessed factors back.
+    for i in factors:
+        res_amp *= i[0]
+        continue
+    for k, v in to_proc.items():
+        res_sums.append((k, v.range))
+
+    return Term(sums=tuple(res_sums), amp=res_amp, vecs=term.vecs)
 
 
 #

@@ -2,6 +2,7 @@
 
 import functools
 import operator
+import string
 import time
 from collections.abc import Sequence
 
@@ -364,6 +365,22 @@ def ensure_pair(obj, role):
     return obj
 
 
+_ALNUM = frozenset(
+    j
+    for i in [string.ascii_letters, string.digits]
+    for j in i
+)
+
+
+def extract_alnum(inp: str):
+    """Extract the alpha numeric part of the string.
+
+    This function is mostly for generating valid identifiers for objects with a
+    mathematically formatted name.
+    """
+    return ''.join(i for i in inp if i in _ALNUM)
+
+
 #
 # Small user utilities
 # --------------------
@@ -486,3 +503,89 @@ class Stopwatch:
         self._print(
             'Total wall time: {:.2f} s'.format(now - self._begin)
         )
+
+
+class CallByIndex:
+    """Wrapper over callables such that they can be called by indexing.
+
+    This wrapper can be helpful for cases where an indexable object is expected
+    but flexibility of a callable is needed.  The given object will be wrapped
+    inside and called when the wrapper is indexed.
+
+    """
+
+    __slots__ = ['_callable']
+
+    def __init__(self, callable):
+        """Initialize the object."""
+        self._callable = callable
+
+    def __getitem__(self, item):
+        """Get the item by calling the given callable."""
+        return self._callable(item)
+
+
+class InvariantIndexable(CallByIndex):
+    """Objects whose indexing always gives the same constant.
+
+    This small utility is for cases where we need an indexable object whose
+    indexing result is actually invariant with respect to the given indices.
+    For an instance constructed with value ``v``, all indexing of it gives ``v``
+    back.
+
+    """
+
+    __slots__ = []
+
+    def __init__(self, v):
+        """Initialize the invariant tensor."""
+        super().__init__(lambda _: v)
+
+
+class SymbResolver:
+    """Resolver based on symbols.
+
+    It can be given an iterable of range/symbols pairs telling that the symbols
+    are associated with the key ranges.  In strict mode, only the given symbols
+    can be resolved to be in the given range.  In non-strict mode, all
+    expressions having one of the symbols will be resolved to be in the range of
+    the symbol.
+
+    Behaviour is undefined if we have non-disjoint symbol sets for different
+    ranges or when we have expression containing symbols for multiple known
+    ranges.
+
+    """
+
+    __slots__ = [
+        '_known',
+        '_strict'
+    ]
+
+    def __init__(self, range_symbs, strict):
+        """Initialize the resolver."""
+
+        known = {}
+        self._known = known
+        for range_, dumms in range_symbs:
+            for i in dumms:
+                known[i] = range_
+                continue
+            continue
+
+        self._strict = strict
+
+    def __call__(self, expr: Expr):
+        """Try to resolve an expression."""
+
+        known = self._known
+        if self._strict:
+            if expr in known:
+                return known[expr]
+        else:
+            for i in expr.atoms(Symbol):
+                if i in known:
+                    return known[i]
+                continue
+
+        return None

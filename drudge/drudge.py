@@ -1,5 +1,6 @@
 """The main drudge and tensor class definition."""
 
+import collections
 import contextlib
 import functools
 import inspect
@@ -13,17 +14,22 @@ from collections.abc import Iterable, Sequence
 
 from IPython.display import Math, display
 from pyspark import RDD, SparkContext
-from sympy import IndexedBase, Symbol, Indexed, Wild, symbols, sympify, Expr
+from sympy import (
+    IndexedBase, Symbol, Indexed, Wild, symbols, sympify, Expr, Add, Matrix, Mul
+)
+from sympy.concrete.summations import eval_sum_symbolic
 
 from .canonpy import Perm, Group
 from .drs import compile_drs, DrsEnv, DrsSymbol
 from .report import Report, ScalarLatexPrinter
 from .term import (
-    Range, sum_term, Term, parse_term, Vec, subst_factor_in_term,
-    subst_vec_in_term, parse_terms, einst_term, diff_term, try_resolve_range,
-    rewrite_term
+    Range, sum_term, Term, Vec, subst_factor_term, subst_vec_term, parse_terms,
+    einst_term, diff_term, try_resolve_range, rewrite_term, Sum_expander,
+    expand_sums_term, ATerms, simplify_amp_sums_term
 )
-from .utils import ensure_symb, BCastVar, nest_bind, prod_
+from .utils import (
+    ensure_symb, BCastVar, nest_bind, sympy_key, SymbResolver
+)
 
 
 class Tensor:
@@ -476,20 +482,75 @@ class Tensor:
             lambda x: x.simplify_deltas(resolvers.value)
         ).filter(_is_nonzero)
 
-    def simplify_sums(self):
-        """Simplify the summations in the tensor.
+    def simplify_sums(self, simplifiers=True, excl_bases=True):
+        """Simplify the summations within the amplitude in the tensor.
 
-        Currently, only bounded summations with dummies not involved in the term
-        will be replaced by a multiplication with its size.
+        This method attempts to perform simplification for concrete summations
+        over dummies that does not appear on the vector part at all.
+
+        First, bounded summations with dummies not actually involved in the term
+        will be replaced by a multiplication with its size.  Then simplification
+        is going to be performed on other summations within the amplitude part.
+
+        Parameters
+        ----------
+
+        simplifiers
+
+            The rules to simplify the internally summed factors of the
+            amplitude.  It should be a Spark broadcast of a mapping from the
+            number of summations indices able to be handled to an iterable of
+            functions implementing the rules.
+
+            The functions will be called with SymPy ``Sum`` objects as the first
+            positional argument.  Then keyword arguments ``resolvers`` will be
+            the resolvers for the ranges, and ``sums_dict`` will hold the
+            original summation dictionary for the term.
+
+            If the same expression or ``None`` is returned, it will be
+            considered to be not simplifiable any more.  When it is
+            simplifiable, the simplified SymPy expression should be returned.
+            Note that, currently, the simplified form cannot be a Sum by itself.
+
+            By default, it is set to True, which will use the
+            :py:attr:`sum_simplifiers` attribute of the current drudge object.
+            It can also be set to anything that evaluates to false to disable
+            deep simplification of the summations.
+
+            By default, the ``sum_simplifiers`` attribute holds a dictionary
+            having only the SymPy ``eval_sum_symbolic`` function for summations
+            with a single summation index.
+
+        excl_bases
+            If summations involved by indexed bases are also going to be
+            excluded from attempts of simplifications.  This can be safely set
+            to true unless customized rules exists.
+
         """
 
-        return self.apply(self._simplify_sums)
+        return Tensor(self._drudge, self._simplify_sums(
+            self._terms, simplifiers=simplifiers, excl_bases=excl_bases
+        ))
 
-    @staticmethod
-    def _simplify_sums(terms: RDD):
+    def _simplify_sums(
+            self, terms: RDD, simplifiers=True, excl_bases=True
+    ):
         """Simplify the summations in the given terms."""
 
-        return terms.map(lambda x: x.simplify_sums())
+        if simplifiers is True:
+            simplifiers = self._drudge.sum_simplifiers.bcast
+
+        # Make it a two-step process for future extensibility.
+        terms = terms.map(lambda x: x.simplify_trivial_sums())
+
+        if simplifiers:
+            terms = terms.map(functools.partial(
+                simplify_amp_sums_term,
+                simplifiers=simplifiers, excl_bases=excl_bases,
+                resolvers=self._drudge.resolvers
+            ))
+
+        return terms
 
     def expand(self):
         """Expand the terms in the tensor.
@@ -507,6 +568,27 @@ class Tensor:
         """Get terms after they are fully expanded."""
         return terms.flatMap(lambda term: term.expand())
 
+    def shallow_expand(self):
+        """Expand terms with addition amplitudes into multiple terms.
+
+        Different from the :py:meth:`expand` method, this method only expands
+        a term when its amplitude is written as an addition on the
+        top-level.  This is useful for cases where the inner structures of the
+        amplitude expression tree is intended to be preserved.
+        """
+        return self.bind(self._shallow_expand)
+
+    @staticmethod
+    def _shallow_expand(term: Term) -> typing.Iterable[Term]:
+        """Expand a term shallowly."""
+        if isinstance(term.amp, Add):
+            return [
+                Term(sums=term.sums, amp=i, vecs=term.vecs)
+                for i in term.amp.args
+            ]
+        else:
+            return [term]
+
     def sort(self):
         """Sort the terms in the tensor.
 
@@ -519,31 +601,44 @@ class Tensor:
         """Sort the terms in the tensor."""
         return terms.sortBy(lambda term: term.sort_key)
 
-    def merge(self):
-        """Merge terms with the same vector and summation part.
+    def merge(self, consts=None, gens=None):
+        """Merge some terms.
 
-        This function merges terms only when their summation list and vector
-        part are *syntactically* the same.  So it is more useful when the
-        canonicalization has been performed and the dummies reset.
+        This function attempts to merge some terms into smaller number of terms.
+        Two terms can be merged only when their summation list, vector part, and
+        selected factors are *syntactically* the same.  So it is more useful
+        when the canonicalization has been performed and the dummies reset.
+
+        When simple merge is disabled, nothing is put into the selected factors,
+        all terms with the same summations and vectors are tried to be merged.
+        When simple merge is enabled, inside the amplitude, any factor
+        containing one of the dummy variables and all indexed quantities are put
+        into the selected factors.  By default, all other factors are considered
+        to be symbols standing for some constants and will be merged.  If the
+        ``consts`` argument is given, only the symbols given there will be
+        considered to be constant symbols for coefficients, with all factors
+        with any other symbol put into the selected factors.  If the ``gens``
+        argument is given, only symbols given here are considered to be
+        generators of the polynomial, with all others considered to be
+        constants.
+
         """
 
         # All the traits could be invalidated by merging.
         return Tensor(
-            self._drudge, self._merge(self._terms)
+            self._drudge, self._merge(self._terms, consts, gens)
         )
 
-    def _merge(self, terms):
+    def _merge(self, terms, consts, gens):
         """Get the term when they are attempted to be merged."""
-        if not self._drudge.simple_merge:
-            return terms.map(
-                lambda term: ((term.sums, term.vecs), term.amp)
-            ).reduceByKey(operator.add).map(
-                lambda x: Term(x[0][0], x[1], x[0][1])
-            )
+        if not self._drudge.simple_merge and consts is None and gens is None:
+            specials = None
         else:
-            return terms.map(_decompose_term).reduceByKey(operator.add).map(
-                lambda x: Term(x[0][0], x[1] * x[0][2], x[0][1])
-            )
+            specials = _DecomposeSpecials(consts, gens)
+
+        return terms.map(
+            functools.partial(_decompose_term, specials=specials)
+        ).reduceByKey(operator.add).map(_recover_term)
 
     #
     # Canonicalization
@@ -633,11 +728,11 @@ class Tensor:
         if num_partitions is not None:
             terms = terms.repartition(num_partitions)
 
-        # Simplify things like zero or deltas.
-        if self._drudge.full_simplify:
-            terms = self._simplify_amps(terms)
-        terms = self._simplify_deltas(terms, False)
+        # Simplify the amplitude part.
+        terms = self._simplify_amps(terms)
         terms = self._simplify_sums(terms)
+        terms = self._simplify_amps(terms)
+        terms = self._simplify_deltas(terms, False)
 
         # Canonicalize the terms and see if they can be merged.
         terms = self._canon(terms, True)
@@ -647,7 +742,7 @@ class Tensor:
 
         free_vars = self._get_free_vars(terms)
         terms = self._reset_dumms(terms, excl=free_vars)
-        terms = self._merge(terms)
+        terms = self._merge(terms, None, None)
 
         # Finally simplify the merged amplitude again.
         if self._drudge.full_simplify:
@@ -683,13 +778,7 @@ class Tensor:
         elif other == 0:
             return n_terms == 0
         else:
-            if n_terms != 1:
-                return False
-            else:
-                term = self.local_terms[0]
-                return term == parse_term(other)
-
-        assert False
+            return self._drudge.sum(other)
 
     #
     # Mathematical operations
@@ -860,7 +949,10 @@ class Tensor:
     # Substitution
     #
 
-    def subst(self, lhs, rhs, wilds=None, full_balance=False, excl=None):
+    def subst(
+            self, lhs, rhs, wilds=None, full_balance=False, excl=None,
+            simult=True
+    ):
         """Substitute the all appearance of the defined tensor.
 
         When the given LHS is a plain SymPy symbol, all its appearances in the
@@ -870,16 +962,51 @@ class Tensor:
         matched against the indices on the LHS.  When a matching succeeds for
         all the indices, the RHS, with the substitution found in the matching
         performed, will be replace the indexed base in the amplitude, or the
-        vector.  Note that for scalar LHS, the RHS must contain no vector.
+        vector.  Note that for scalar LHS, the RHS must contain no vector.  For
+        vector LHS, also supported is a product of vectors.  This will lead to
+        pattern matching inside the vector part.
 
-        Since we do not commonly define tensors with wild symbols, an option
-        ``wilds`` can be used to give a mapping translating plain symbols on the
-        LHS and the RHS to the wild symbols that would like to be used.  The
-        default value of None could make all **plain** symbols in the indices of
-        the LHS to be translated into a wild symbol with the same name and no
-        exclusion. And empty dictionary can be used to disable all such
-        automatic translation.  The default value of None should satisfy most
-        needs.
+        A special case is when the LHS is a plain integral unity.  In this case,
+        the scalar terms will be replaced by product with the RHS, as if the
+        identity element has been replaced by the RHS.
+
+        Parameters
+        ----------
+
+        lhs
+            The left-hand side of the substitution.
+
+        rhs
+            The right-hand side of the substituion.
+
+        wilds
+            Since we do not commonly define tensors with wild symbols, an option
+            ``wilds`` can be used to give a mapping translating plain symbols on
+            the LHS and the RHS to the wild symbols that would like to be used.
+            The default value of None could make all **plain** symbols in the
+            indices of the LHS to be translated into a wild symbol with the same
+            name and no exclusion. And empty dictionary can be used to disable
+            all such automatic translation.  The default value of None should
+            satisfy most needs.
+
+        full_balance
+            If load-balancing is going to be performed after each substitution
+            step.  This is normally not needed.
+
+        excl
+            Symbols that needs to be excluded to be used as dummies.
+
+        simult
+            The core substitution algorithm works by making one substitution at
+            a time until no more left-hand side can be matched successfully.  In
+            this way, if the pattern in the LHS reappears on the RHS, infinite
+            loop will be resulted.  When it is set to true, the
+            newly-substituted part will no longer participate in the matching.
+
+            By default, it is true.  Internally, it decorates the bases on the
+            LHS to special forms, so that the originally-present ones are
+            different from the newly-substituted ones.  Note that its disabling
+            makes sense only when the LHS is a complex pattern.
 
         Examples
         --------
@@ -930,18 +1057,48 @@ class Tensor:
 
         """
 
-        if isinstance(lhs, (Vec, Indexed)):
-            base = lhs.base
+        # Special case of the unity LHS.
+        if lhs == 1:
+            scalar_part = self.filter(lambda x: len(x.vecs) == 0)
+            other_part = self.filter(lambda x: len(x.vecs) > 0)
+            res = other_part + scalar_part * rhs
+            return res
+
+        # Shallow parsing of the left-hand side.
+
+        if isinstance(lhs, Indexed):
+            if_scalar = True
+            if_indexed = True
+            bases = (lhs.base,)
         elif isinstance(lhs, Symbol):
-            base = lhs
+            if_scalar = True
+            if_indexed = False
+            bases = (lhs,)
+        elif isinstance(lhs, ATerms):
+            if_scalar = False
+            if_indexed = True
+
+            if len(lhs.terms) != 1:
+                raise ValueError('Invalid LHS to substitute', lhs.terms)
+            term = lhs.terms[0]
+            if len(term.sums) != 0 or term.amp != 1:
+                raise ValueError('Invalid LHS to substitute', term)
+            vecs = term.vecs
+            bases = {i.base for i in vecs}
+
+            # In this way, lhs is either an SymPy expression (Indexed or Symbol)
+            # or a tuple.
+            lhs = vecs
         else:
             raise TypeError(
                 'Invalid LHS for substitution', lhs,
                 'expecting vector, indexed, or symbol'
             )
 
-        if not self.has_base(base):
+        if not all(self.has_base(i) for i in bases):
             return self
+
+        # Shallow processing of the right-hand side.
 
         # We need to gather, and later broadcast all the terms.  The rational is
         # that the RHS is usually small in real problems.
@@ -950,35 +1107,120 @@ class Tensor:
         else:
             rhs_terms = parse_terms(rhs)
 
-        if isinstance(lhs, (Symbol, Indexed)) and not all(
+        if if_scalar and not all(
                 i.is_scalar for i in rhs_terms
         ):
             raise ValueError('Invalid RHS for substituting a scalar', rhs)
 
-        if wilds is None:
-            if isinstance(lhs, (Indexed, Vec)):
-                wilds = {
-                    i: Wild(i.name) for i in lhs.indices if
-                    isinstance(i, Symbol)
-                }
-            else:
-                wilds = {}
+        # Handling of the wilds.
 
-        if isinstance(lhs, Indexed):
+        if wilds is None:
+            wilds = {}
+            if if_indexed:
+                if if_scalar:
+                    index_bunches = [lhs.indices]
+                else:
+                    index_bunches = [i.indices for i in lhs]
+                for indices in index_bunches:
+                    wilds.update(
+                        (i, Wild(i.name))
+                        for i in indices if isinstance(i, Symbol)
+                    )
+
+        if if_scalar:
             lhs = lhs.xreplace(wilds)
-        elif isinstance(lhs, Vec):
-            lhs = lhs.map(lambda x: x.xreplace(wilds))
+        else:
+            lhs = tuple(
+                i.map(lambda x: x.xreplace(wilds)) for i in lhs
+            )
 
         rhs_terms = [j.subst(wilds) for i in rhs_terms for j in i.expand()]
 
-        expanded = self.expand()
-        return expanded._subst(
+        # Processing of the expression to be substituted.
+        #
+        # Here we manipulate lhs and create target and restore.
+
+        decr_suffix = 'InternalProxy'
+
+        if not simult:
+
+            target = self
+            restore = None
+
+        elif if_scalar and not if_indexed:
+
+            assert isinstance(lhs, Symbol)
+            orig_lhs = lhs
+            decored_lhs = Symbol(lhs.name + decr_suffix)
+            target = self.map2amps(lambda x: x.xreplace({
+                orig_lhs: decored_lhs
+            }))
+            lhs = decored_lhs
+
+            # Not possible for the target to be failed to be matched against.
+            restore = None
+
+        elif if_scalar:
+
+            assert isinstance(lhs, Indexed)
+            orig_base = lhs.base
+            decored_base = IndexedBase(orig_base.label.name + decr_suffix)
+
+            def decr(x: Expr):
+                return x.xreplace({
+                    orig_base: decored_base
+                })
+
+            target = self.map2amps(decr)
+            lhs = decr(lhs)
+
+            def restore(t: Term):
+                return t.map(lambda x: x.xreplace({
+                    decored_base: orig_base
+                }), skip_vecs=True)
+
+        else:
+
+            # For vectors, we decorate them by attaching a special placeholder
+            # to their original labels, since vector labels has been documented
+            # to be allowed to be anything.
+
+            def decr_vecs(vs: typing.Tuple[Vec]):
+                return tuple(
+                    Vec(label=(i.label, _Decred(0)), indices=i.indices)
+                    for i in vs
+                )
+
+            target = self.map(lambda t: t.map(vecs=decr_vecs(t.vecs)))
+            assert isinstance(lhs, tuple)
+            lhs = decr_vecs(lhs)
+
+            def restore(t: Term):
+                # Only restore the decorated vectors.
+                return t.map(vecs=tuple(
+                    Vec(label=i.label[0], indices=i.indices)
+                    if isinstance(i.label, tuple) and len(i.label) == 2
+                       and isinstance(i.label[1], _Decred)
+                    else i
+                    for i in t.vecs
+                ))
+
+        target = target.expand()
+
+        # Invoke the core facility.
+        res = target._subst(
             lhs, rhs_terms, full_balance=full_balance, excl=excl
         )
 
+        # Restore
+        if restore is None:
+            return res
+        else:
+            return res.map(restore)
+
     def _subst(
-            self, lhs: typing.Union[Vec, Indexed, Symbol], rhs_terms,
-            full_balance, excl=None
+            self, lhs: typing.Union[typing.Tuple[Vec], Indexed, Symbol],
+            rhs_terms, full_balance, excl=None
     ):
         """Core substitution function.
 
@@ -988,7 +1230,7 @@ class Tensor:
         """
 
         free_vars_local = (
-            self.free_vars | set.union(*[i.free_vars for i in rhs_terms])
+                self.free_vars | set.union(*[i.free_vars for i in rhs_terms])
         )
         if excl is not None:
             free_vars_local |= excl
@@ -1007,13 +1249,13 @@ class Tensor:
         rhs_terms = self._drudge.ctx.broadcast(rhs_terms)
 
         if isinstance(lhs, (Indexed, Symbol)):
-            res = nest_bind(subs_states, lambda x: subst_factor_in_term(
+            res = nest_bind(subs_states, lambda x: subst_factor_term(
                 x[0], lhs, rhs_terms.value,
                 dumms=dumms.value, dummbegs=x[1], excl=free_vars.value,
                 full_simplify=full_simplify
             ), full_balance=full_balance)
         else:
-            res = nest_bind(subs_states, lambda x: subst_vec_in_term(
+            res = nest_bind(subs_states, lambda x: subst_vec_term(
                 x[0], lhs, rhs_terms.value,
                 dumms=dumms.value, dummbegs=x[1], excl=free_vars.value
             ), full_balance=full_balance)
@@ -1023,7 +1265,10 @@ class Tensor:
             self._drudge, res_terms, free_vars=free_vars_local, expanded=True
         )
 
-    def subst_all(self, defs, simplify=False, full_balance=False, excl=None):
+    def subst_all(
+            self, defs, simplify=False, full_balance=False, excl=None,
+            simult=True
+    ):
         """Substitute all given definitions serially.
 
         The definitions should be given as an iterable of either
@@ -1046,7 +1291,9 @@ class Tensor:
                     'expecting definition or LHS/RHS pair'
                 )
 
-            res = res.subst(lhs, rhs, full_balance=full_balance, excl=excl)
+            res = res.subst(
+                lhs, rhs, full_balance=full_balance, excl=excl, simult=simult
+            )
             if simplify:
                 res = res.simplify().repartition()
 
@@ -1125,6 +1372,55 @@ class Tensor:
             self._drudge.ctx.parallelize(new_terms)
         )), new_defs
 
+    def expand_sums(
+            self, range_: Range, expander: Sum_expander,
+            exts=None, conv_accs=None
+    ):
+        """Expand some symbolic summations.
+
+        The basic structure of drudge always treat summation dummies as
+        primitive scalar quantities.  However, sometimes, we would want to use a
+        single summation over an abstract domain to symbolically denote multiple
+        simple summations.
+
+        Rather than adding this to the base system with possibly significant
+        complication of the code base, here we seek a pragmatic solution, where
+        we can just use plain symbols to denote complex summations, and this
+        function can be used to expand the summation into its primitive
+        components when we need to.
+
+        Parameters
+        ----------
+
+        range_
+            The range all summations over which are to be expanded.
+
+        expander
+            A callable to give information how the summation over a dummy should
+            be expanded.  It will be called with a dummy that is summed over the
+            given range, and it is expected to return an iterable of triples,
+            formed by the new dummy and new range, followed by previous form the
+            the dummy in the expression, which will be replaced by the new
+            dummy.  Note that after the substitution, all the original dummies
+            over the expanded range should no longer be present in the
+            expression, or an error will be raised.
+
+        exts
+            Free symbols that are also going to be decomposed in the same way as
+            the summations over the given range.
+
+        conv_accs
+            When it is set to an iterable of accessors, all their access of the
+            original dummies will be substituted by the same accessor applied to
+            the first dummy from the expander.  This can be helpful for cases
+            where we just strip one (some) component(s) from a symbolic bundle.
+
+        """
+        return self.map(functools.partial(
+            expand_sums_term, range_=range_, expander=expander,
+            exts=exts, conv_accs=conv_accs
+        ))
+
     #
     # Analytic gradient
     #
@@ -1180,8 +1476,8 @@ class Tensor:
 
             symms = self._drudge.symms.value
             if_symm = (
-                variable.base in symms or
-                (variable.base, len(variable.indices)) in symms
+                    variable.base in symms or
+                    (variable.base, len(variable.indices)) in symms
             )
             if if_symm:
                 warnings.warn(
@@ -1265,13 +1561,13 @@ class Tensor:
         """
         return Tensor(self._drudge, self._terms.flatMap(func))
 
-    def map2scalars(self, action, skip_vecs=False):
+    def map2scalars(self, action, skip_vecs=False, skip_ranges=True):
         """Map the given action to the scalars in the tensor.
 
         The given action should return SymPy expressions for SymPy expressions,
         the amplitude for each terms and the indices to the vectors, in the
         tensor.  Note that this function is more supposed for free variables and
-        does not change the summations in the terms and the dummies.
+        does not change the summation dummies in the terms.
 
         Parameters
         ----------
@@ -1284,11 +1580,24 @@ class Tensor:
             to the vectors.  It could be used to boost the performance when we
             know that the action need no application on the indices.
 
+        skip_ranges
+            When it is set, the callable will no longer be mapped to the bounds
+            of the ranges.
+
         """
 
-        return Tensor(self._drudge, self._terms.map(
-            lambda x: x.map(action, skip_vecs=skip_vecs)
-        ))
+        return Tensor(self._drudge, self._terms.map(lambda x: x.map(
+            action, skip_vecs=skip_vecs, skip_ranges=skip_ranges
+        )))
+
+    def map2amps(self, action):
+        """Map the given action to the amplitudes in the tensor.
+
+        This method is a plain wrapper for calling :py:meth:`map2scalars` with
+        vectors skipped.
+        """
+
+        return self.map2scalars(action, skip_vecs=True)
 
     #
     # Operations from the drudge
@@ -1365,11 +1674,6 @@ class TensorDef(Tensor):
 
     """
 
-    __slots__ = [
-        '_base',
-        '_exts',
-    ]
-
     def __init__(self, base, exts, tensor: Tensor):
         """Initialize the tensor definition.
 
@@ -1409,12 +1713,12 @@ class TensorDef(Tensor):
         self._exts = []
         for i in exts:
             explicit_ext = (
-                isinstance(i, Sequence) and len(i) == 2 and
-                isinstance(i[0], Symbol) and isinstance(i[1], Range)
+                    isinstance(i, Sequence) and len(i) == 2 and
+                    isinstance(i[0], Symbol) and isinstance(i[1], Range)
             )
             if explicit_ext:
                 self._exts.append(tuple(i))
-            elif isinstance(i, Symbol):
+            elif isinstance(i, Expr):
                 self._exts.append((
                     i, None
                 ))
@@ -1425,16 +1729,13 @@ class TensorDef(Tensor):
                 )
             continue
 
-        if not isinstance(base, (Vec, IndexedBase, Symbol)):
-            raise TypeError(
-                'Invalid base for tensor definition', base,
-                'expecting vector or scalar base'
-            )
-
         # Normalize the base.
         base_name = str(base)
         is_scalar = self.is_scalar
-        if is_scalar and len(self._exts) == 0:
+        if base == 1:
+            # Special case for identity definition.
+            self._base = base
+        elif is_scalar and len(self._exts) == 0:
             self._base = Symbol(base_name)
         elif is_scalar:
             self._base = IndexedBase(base_name)
@@ -1682,11 +1983,16 @@ class Drudge:
         self._tensor_methods = {}
 
         self._drs_specials = types.SimpleNamespace()
-        self._drs_specials.S = DrsSymbol
+        self._drs_specials.S = functools.partial(DrsSymbol, self)
         self._drs_specials.sum_ = sum
         self._drs_specials.DRUDGE = self
 
         self._inside_drs = False
+
+        # Default simplification of summation.
+        self.sum_simplifiers = BCastVar(self._ctx, {
+            1: [_simplify_symbolic_sum]
+        })
 
     @property
     def ctx(self):
@@ -1986,22 +2292,30 @@ class Drudge:
                                     'expecting Perm or iterable of Perms')
                 continue
 
-            group = Group(gens)
+            if len(gens) > 0:
+                group = Group(gens)
+            else:
+                group = None
 
-        valid_valence = (valence is None or (
-            isinstance(valence, int) and valence > 1
-        ))
-        if not valid_valence:
-            raise ValueError(
-                'Invalid valence', valence, 'expecting positive integer'
-            )
+        if valence is not None:
+            # None is a valid valence.
+            try:
+                valence = int(valence)
+            except ValueError:
+                raise ValueError(
+                    'Invalid valence', valence, 'expecting integer'
+                )
+            if valence < 1:
+                raise ValueError(
+                    'Invalid valence', valence, 'expecting positive integer'
+                )
 
         self._symms.var[
             base if valence is None else (base, valence)
         ] = group
 
         if set_base_name:
-            self.set_name(**{str(base.label): base})
+            self.set_name(**{str(base): base})
 
         return group
 
@@ -2023,8 +2337,8 @@ class Drudge:
         self._resolvers.var.append(resolver)
         return
 
-    def add_resolver_for_dumms(self):
-        """Add the resolver for the dummies for each range.
+    def add_resolver_for_dumms(self, ranges=None, strict=False):
+        """Add the resolver for the dummies.
 
         With this method, the default dummies for each range will be resolved to
         be within the range for all of them.  This method should normally be
@@ -2033,15 +2347,38 @@ class Drudge:
 
         Note that dummies added later will not be automatically added.  This
         method can be called again.
+
+        Parameters
+        ----------
+
+        ranges
+            By default, resolver for all ranges will be attempted to be added.
+            Or a specific iterable of ranges can also be given to add resolver
+            only for the given ranges.
+
+        strict
+            By default, any expression contains a dummy of the range will be
+            considered to be of the range.  If strict is set to true, only the
+            dummy appearing by themself will be resolved.
+
+
         """
 
-        dumm_resolver = {}
-        for k, v in self._dumms.ro.items():
-            for i in v:
-                dumm_resolver[i] = k
+        # Normalize the ranges to iterable of range/dummies pairs.
+        curr_dumms = self._dumms.ro.items()
+        if ranges is None:
+            to_proc = curr_dumms
+        else:
+            to_proc = []
+            for i in ranges:
+                if i not in curr_dumms:
+                    raise ValueError(
+                        'Unexpected range, dummies not yet set', i
+                    )
+                to_proc.append((i, curr_dumms[i]))
                 continue
-            continue
-        self.add_resolver(dumm_resolver)
+
+        self.add_resolver(SymbResolver(to_proc, strict))
 
     def add_default_resolver(self, range_):
         """Add a default resolver.
@@ -2231,16 +2568,19 @@ class Drudge:
                 sum_args, summand, predicate=predicate
             ))
 
-    def einst(self, summand) -> Tensor:
+    def einst(self, summand, auto_exts: bool = False) -> typing.Union[
+        Tensor, typing.Tuple[Tensor, typing.AbstractSet[Symbol]]
+    ]:
         """Create a tensor from Einstein summation convention.
 
         By calling this function, summations according to the Einstein summation
-        convention will be added to the terms.  Note that for a symbol to be
-        recognized as a summation, it must appear exactly twice in its
+        convention will be added to the terms.  Note that this function is
+        mostly designed for the most conventional tensor problems.  For a symbol
+        to be recognized as a summation, it must appear twice or more in its
         **original form** in indices, and its range needs to be able to be
-        resolved.  When a symbol is suspiciously an Einstein summation dummy but
-        does not satisfy the requirement precisely, it will **not** be added as
-        a summation, but a warning will also be given for reference.
+        resolved.  When a symbol is used in compound form as tensor indices, it
+        will be considered to be for non-conventional purposes and will no
+        longer be automatically recognized as summations.
 
         For instance, we can have the following fairly conventional Einstein
         form,
@@ -2256,40 +2596,93 @@ class Drudge:
             >>> str(tensor)
             'sum_{b} x[a, b]*x[b, c]'
 
-        However, when a dummy is not in the most conventional form, the
-        summations cannot be automatically added.  For instance,
-
-        .. doctest::
-
-            >>> tensor = dr.einst(x[a, b] * x[b, b])
-            >>> str(tensor)
-            'x[a, b]*x[b, b]'
-
-        ``b`` is not summed over since it is repeated three times.  Note also
-        that the symbol must be able to be resolved its range for it to be
-        summed automatically.
-
         Note that in addition to creating tensors from scratch, this method can
         also be called on an existing tensor to add new summations.  In that
         case, no existing summations will be touched.
 
+        For indices whose range is resolved to a tuple of multiple ranges, the
+        term will be expanded to sum over all the given ranges.
+
+        Parameters
+        ----------
+
+        summand
+
+            The summand to be applied the Einstein summation convention.
+
+        auto_exts
+
+            If external indices will tried to be recognized automatically and
+            returned as a second return value.  For each term, symbols appearing
+            exactly once **in its raw form as indices** will be considered as
+            external indices.  When the set of external indices are the same for
+            all terms, it will be returned as the second return value, or a
+            ``ValueError`` will be raised.
+
         """
 
         resolvers = self.resolvers
-        if isinstance(summand, Tensor):
-            summand_terms = summand.expand().terms
-            return Tensor(self, summand_terms.map(
-                lambda x: einst_term(x, resolvers.value)
-            ), expanded=True)
-        else:
-            # We need to expand the possibly parenthesized user input.
-            summand_terms = []
-            for i in parse_terms(summand):
-                summand_terms.extend(i.expand())
 
-            return self.create_tensor(
-                [einst_term(i, resolvers.value) for i in summand_terms]
+        # Separate the cases for local and distributed terms for optimization.
+        if isinstance(summand, Tensor):
+
+            einst_res = summand.expand().terms.map(
+                lambda x: einst_term(x, resolvers.value)
+            ).cache()
+            tensor = Tensor(
+                self, einst_res.flatMap(operator.itemgetter(0)), expanded=True
             )
+
+            if not auto_exts:
+                exts_union = None
+                exts_inters = None
+            else:
+
+                def seq_op(curr, new):
+                    """Merge current externals with a new Einstein result."""
+                    curr[0].update(new[1])
+                    curr[1] = _inters(curr[1], new[1])
+                    return curr
+
+                def comb_op(curr, new):
+                    """Merge externals from different partitions."""
+                    curr[0].update(new[0])
+                    curr[1] = _inters(curr[1], new[1])
+                    return curr
+
+                exts_union, exts_inters = einst_res.aggregate(
+                    [set(), None], seq_op, comb_op
+                )
+
+        else:
+            res_terms = []
+            exts_union = set()
+            exts_inters = None
+
+            for i in parse_terms(summand):
+                # We need to expand the possibly parenthesized user input.
+                for j in i.expand():
+                    terms, exts = einst_term(j, resolvers.value)
+                    res_terms.extend(terms)
+                    exts_union |= exts
+                    exts_inters = _inters(exts_inters, exts)
+                    continue
+                continue
+            tensor = self.create_tensor(res_terms)
+
+        # End splitting between distributed and local input.
+
+        if not auto_exts:
+            return tensor
+
+        if exts_union != exts_inters:
+            diff = exts_union - exts_inters
+            raise ValueError(
+                'Invalid external indices for Einstein convention',
+                diff, 'appeared only in some terms'
+            )
+
+        return tensor, exts_inters
 
     def create_tensor(self, terms):
         """Create a tensor with the terms given in the argument.
@@ -2315,7 +2708,7 @@ class Drudge:
         initial arguments
             The left-hand side of the definition.  It can be given as an indexed
             quantity, either SymPy Indexed instances or an indexed vector, with
-            all the indices being plain symbols whose range is able to be
+            all the plain symbol indices having their range is able to be
             resolved.  Or a base can be given, followed by the symbol/range
             pairs for the external indices.
 
@@ -2333,18 +2726,35 @@ class Drudge:
         tensor = content if isinstance(content, Tensor) else self.sum(content)
         return TensorDef(base, exts, tensor)
 
-    def define_einst(self, *args) -> TensorDef:
+    def define_einst(self, *args, auto_exts=False) -> TensorDef:
         """Make a tensor definition based on Einstein summation convention.
 
-        Basically the same function as the :py:meth:`define`, just the content
-        will be interpreted according to the Einstein summation convention.
+        This method basically performs function very similar to the
+        :py:meth:`define` method, just the content will be interpreted according
+        to the Einstein summation convention.  When the argument ``auto_exts``
+        is set, the lhs of the definition is read in the same way as the
+        :py:meth:`define` method.  When it is turned on, the lhs can be given
+        only by a base and the external indices will be attempted to be
+        inferred, as described in :py:meth:`einst`.
+
         """
 
         if len(args) == 0:
             raise ValueError('Expecting arguments for definition.')
 
-        base, exts = self._parse_def_lhs(args[:-1])
-        tensor = self.einst(args[-1])
+        if auto_exts:
+            if len(args) != 2:
+                raise TypeError(
+                    'Invalid number of arguments, base and rhs expected!'
+                )
+            tensor, exts = self.einst(args[-1], auto_exts=True)
+            exts = self._form_exts(exts)
+            exts.sort(key=lambda x: (x[1], sympy_key(x[0])))
+            base = args[0]
+        else:
+            tensor = self.einst(args[-1])
+            base, exts = self._parse_def_lhs(args[:-1])
+
         return TensorDef(base, exts, tensor)
 
     def _parse_def_lhs(self, args):
@@ -2360,21 +2770,37 @@ class Drudge:
             arg = args[0]
             if isinstance(arg, (Indexed, Vec)):
                 base = arg.base
-                exts = []
-                for i in arg.indices:
-                    range_ = try_resolve_range(i, {}, self.resolvers.value)
-                    if range_ is None:
-                        raise ValueError(
-                            'Invalid index', i, 'in', args,
-                            'range cannot be resolved'
-                        )
-                    exts.append((i, range_))
-                    continue
+                exts = self._form_exts(arg.indices)
                 return base, exts
             else:
                 return arg, ()
         else:
             return args[0], args[1:]
+
+    def _form_exts(self, indices):
+        """Form dummy/range pairs from symbols.
+
+        For plain symbols, the range is resolved based on the resolver, or
+        ValueError will be raised.  Currently, when it is resolved to have
+        multiple ranges, it will be treated as a generic one without explicit
+        range.
+        """
+        exts = []
+        for i in indices:
+            if isinstance(i, Symbol):
+                range_ = try_resolve_range(i, {}, self.resolvers.value)
+                if range_ is None:
+                    raise ValueError(
+                        'Invalid index', i, 'range cannot be resolved'
+                    )
+                if isinstance(range_, Sequence):
+                    exts.append(i)
+                else:
+                    exts.append((i, range_))
+            else:
+                exts.append(i)
+            continue
+        return exts
 
     def def_(self, *args) -> TensorDef:
         """Make a tensor definition according to convention set in drudge.
@@ -2399,7 +2825,7 @@ class Drudge:
 
     def format_latex(
             self, inp, sep_lines=False, align_terms=False, proc=None,
-            no_sum=False, scalar_mul=''
+            no_sum=False, bounds=False, scalar_mul=''
     ):
         r"""Get the LaTeX form of a given tensor or tensor definition.
 
@@ -2439,6 +2865,11 @@ class Drudge:
             cases where a convention, like the Einstein's, exists for the
             summations.
 
+        bounds : bool
+
+            If the bounds of summations should be printed when they are
+            explicitly present.
+
         scalar_mul : str
 
             The text for scalar multiplication.  By default, scalar
@@ -2448,15 +2879,14 @@ class Drudge:
             of tensors with terms with many factors, special command
             ``\invismult`` can be used, which just makes a small space but
             enables the factors to be automatically split by the ``breqn``
-            package.
+            package.  Note that this option has effect only for expanded terms,
+            where the scalar multiplication occurs on the top-level.
 
         """
 
         if isinstance(inp, TensorDef):
-            prefix = (
-                         self._latex_sympy(inp.lhs) if inp.is_scalar else
-                         self._latex_vec(inp.lhs)
-                     ) + ' = '
+            prefix = (self._latex_vec(inp.lhs) if isinstance(inp.lhs, Vec) else
+                      self._latex_sympy(inp.lhs)) + ' = '
         elif isinstance(inp, Tensor):
             prefix = ''
         else:
@@ -2470,7 +2900,9 @@ class Drudge:
 
         terms = []
         for i, v in enumerate(inp_terms):
-            term = self._latex_term(v, no_sum=no_sum, scalar_mul=scalar_mul)
+            term = self._latex_term(
+                v, no_sum=no_sum, bounds=bounds, scalar_mul=scalar_mul
+            )
 
             if proc is not None:
                 term = proc(term, term=v, idx=i)
@@ -2486,46 +2918,76 @@ class Drudge:
 
         return prefix + term_sep.join(terms)
 
-    def _latex_term(self, term, no_sum=False, scalar_mul=''):
+    def _latex_term(self, term, no_sum=False, bounds=False, scalar_mul=''):
         """Format a term into LaTeX form.
 
         This method does not generally need to be overridden.
         """
 
+        # Small utility.
+        def parenth(content: str):
+            """Parenthesize the string."""
+            return ''.join([r'\left(', content, r'\right)'])
+
         parts = []
 
-        factors, coeff = term.amp_factors
-        if coeff == 1:
-            coeff_latex = None
-        elif coeff == -1:
-            parts.append('-')
-            coeff_latex = None
-        else:
-            coeff_latex = self._latex_sympy(coeff)
-            if coeff_latex[0] == '-':
+        # Here we treat the amplitude first so that a possible minus sign can be
+        # put before the term.
+        amp_parts = []
+
+        if isinstance(term.amp, Add):
+            # In this case, we need a big parenthesis for the amplitude.
+            first_try = self._latex_sympy(term.amp)
+            if first_try[0] == '-':
                 parts.append('-')
-                coeff_latex = coeff_latex[1:]
+                amp_latex = self._latex_sympy(-term.amp)
+            else:
+                amp_latex = first_try
+
+            amp_parts.append(parenth(amp_latex))
+        else:
+            factors, coeff = term.amp_factors
+            if_pure_coeff = len(factors) == 0 and len(term.vecs) == 0
+
+            if coeff == 1 and not if_pure_coeff:
+                pass
+            elif coeff == -1 and not if_pure_coeff:
+                parts.append('-')
+            else:
+                coeff_latex = self._latex_sympy(coeff)
+                if coeff_latex[0] == '-':
+                    parts.append('-')
+                    coeff_latex = coeff_latex[1:]
+
+                if isinstance(coeff, Add):
+                    coeff_latex = parenth(coeff_latex)
+                amp_parts.append(coeff_latex)
+
+            if len(factors) > 0:
+                scalar_mul = ''.join([' ', scalar_mul, ' '])
+
+                amp_parts.append(scalar_mul.join(
+                    parenth(self._latex_sympy(i)) if isinstance(i, Add)
+                    else self._latex_sympy(i)
+                    for i in factors
+                ))
+
+        if not term.is_scalar:
+            amp_parts.append(scalar_mul)
 
         if not no_sum:
-            parts.extend(r'\sum_{{{} \in {}}}'.format(
-                i, j.label
-            ) for i, j in term.sums)
+            for i, j in term.sums:
+                dumm = self._latex_sympy(i)
+                if bounds and j.bounded:
+                    form = r'\sum_{{{} = {}}}^{{{}}}'.format(
+                        dumm, self._latex_sympy(j.lower),
+                        self._latex_sympy(j.upper - 1)  # Math notation.
+                    )
+                else:
+                    form = r'\sum_{{{} \in {}}}'.format(dumm, j.label)
+                parts.append(form)
 
-        if coeff_latex is not None:
-            parts.append(coeff_latex)
-
-        if len(factors) > 0:
-            scalar_mul = ''.join([' ', scalar_mul, ' '])
-
-            if coeff_latex is not None:
-                parts.append(scalar_mul)
-
-            parts.append(scalar_mul.join(
-                self._latex_sympy(i) for i in factors
-            ))
-
-            if not term.is_scalar:
-                parts.append(scalar_mul)
+        parts.append(' '.join(amp_parts))
 
         vecs = self._latex_vec_mul.join(
             self._latex_vec(i) for i in term.vecs
@@ -2552,8 +3014,11 @@ class Drudge:
         """
 
         head = r'\mathbf{{{}}}'.format(vec.label)
-        indices = ', '.join(self._latex_sympy(i) for i in vec.indices)
-        return r'{}_{{{}}}'.format(head, indices)
+        if len(vec.indices) > 0:
+            indices = ', '.join(self._latex_sympy(i) for i in vec.indices)
+            return r'{}_{{{}}}'.format(head, indices)
+        else:
+            return head
 
     _latex_vec_mul = r' \otimes '
 
@@ -2595,7 +3060,7 @@ class Drudge:
 
         """
 
-        report = Report(filename, title)
+        report = Report(filename, title, self)
         yield report
         report.write()
 
@@ -2797,16 +3262,185 @@ class Drudge:
         self._inside_drs = False
         return env
 
-    @staticmethod
-    def simplify(arg, **kwargs):
+    def simplify(self, arg, **kwargs):
         """Make simplification for both SymPy expressions and tensors.
 
-        This method is mostly designed to be used in drudge scripts.  The actual
-        simplification is dispatched based on the type of the given argument.
-        Simple SymPy simplification for SymPy expressions, drudge simplification
-        for drudge tensors or tensor definitions.
+        This method is mostly designed to be used in drudge scripts.  But it
+        can also be used inside Python scripts for convenience.
+
+        The actual simplification is dispatched based on the type of the given
+        argument. Simple SymPy simplification for SymPy expressions, drudge
+        simplification for drudge tensors or tensor definitions, or the argument
+        will be attempted to be converted into a tensor.
+
         """
-        return arg.simplify(**kwargs)
+        if isinstance(arg, (Tensor, Expr)):
+            return arg.simplify(**kwargs)
+        else:
+            return self.sum(arg).simplify(**kwargs)
+
+    #
+    # Mathematical utilities.
+    #
+
+    #
+    # Utilities for linear transformations of vectors.
+    #
+
+    @staticmethod
+    def lvt_defs2mat(
+            defs: typing.Iterable[TensorDef], rhs_vecs=None, ret_rhs=False
+    ):
+        r"""Turn a linear vector transformation into matrix form.
+
+        A linear vector transformation is a set of definitions of vectors as
+        simple linear combinations of another set of vectors, where the linear
+        combination only has plain symbolic scalar coefficients without any
+        symbolic summations.
+
+        With this method, given a linear vector transformation as a list of
+        tensor definitions, the matrix :math:`M` of the transformation will be
+        formed, which makes
+
+        .. math::
+
+            \mathbf{L} = M \mathbf{R}
+
+        where :math:`\mathbf{L}` is the column vector of the vectors on the
+        left-hand side and :math:`\mathbf{R}` is the column vector of the
+        vectors on the right-hand side.
+
+        Parameters
+        ----------
+
+        defs
+            An iterable giving all the definitions.  No vector should be
+            redefined and non-vector definitions will be construed as definition
+            of unity.
+
+        rhs_vecs
+            The vectors on the right-hand side.  When it is given as None, all
+            vectors appearing in the RHSes of the definitions will be ordered in
+            an non-deterministic way.
+
+        ret_rhs
+            If the actual list of RHS vectors is going to be returned.
+
+        """
+
+        # Parse the definitions to mapping from LHS to coefficients dictionary.
+        coeffs = collections.OrderedDict()
+        for def_ in defs:
+            lhs = def_.lhs
+            if not isinstance(lhs, Vec):
+                lhs = 1
+            if lhs in coeffs:
+                raise ValueError(
+                    'Duplicate definition', def_.lhs
+                )
+            curr_coeffs = collections.defaultdict(lambda: 0)
+            coeffs[lhs] = curr_coeffs
+
+            for term in def_.local_terms:
+
+                if len(term.sums) > 0:
+                    raise NotImplementedError(
+                        'RHS for', lhs, 'too complicated', term
+                    )
+
+                vecs = term.vecs
+                if len(vecs) > 1:
+                    raise ValueError(
+                        'Nonlinear term for ', lhs, 'in', term
+                    )
+                elif len(vecs) == 1:
+                    curr_coeffs[vecs[0]] += term.amp
+                else:
+                    curr_coeffs[1] += term.amp
+
+                continue  # Go to next term.
+
+            continue  # Go to the next definition.
+
+        if rhs_vecs is None:
+            rhs_vecs = set()
+            for i in coeffs.values():
+                rhs_vecs.update(i.keys())
+                continue
+            rhs_vecs = list(rhs_vecs)
+
+        res_coeffs = []
+        for lhs, rhs in coeffs.items():
+            row = []
+            for i in rhs_vecs:
+                if i in rhs:
+                    row.append(rhs.pop(i))
+                else:
+                    row.append(0)
+                continue
+            if len(rhs) != 0:
+                raise ValueError(
+                    'Terms with vectors not given as RHS', list(rhs.keys())
+                )
+            res_coeffs.append(row)
+            continue
+
+        res = Matrix(res_coeffs)
+        if ret_rhs:
+            return res, rhs_vecs
+        else:
+            return res
+
+    def lvt_mat2defs(
+            self, mat: Matrix, lhs_vecs: typing.Iterable[Vec],
+            rhs_vecs: typing.Iterable[Vec]
+    ):
+        """Form definitions from a linear transformation matrix.
+
+        This is the exact inverse of the operation defined in
+        :py:meth:`lvt_defs2mat`.
+        """
+
+        lhs_vecs = list(lhs_vecs)
+        rhs_vecs = list(rhs_vecs)
+        n_rows, n_cols = mat.shape
+
+        if n_rows != len(lhs_vecs):
+            raise ValueError(
+                'Expecting', n_rows, 'LHS vectors', len(lhs_vecs), 'given'
+            )
+        if n_cols != len(rhs_vecs):
+            raise ValueError(
+                'Expecting', n_cols, 'RHS vectors', len(rhs_vecs), 'given'
+            )
+
+        defs = []
+        for idx in range(n_rows):
+            def_ = self.define(lhs_vecs[idx], sum(
+                i * j for i, j in zip(mat.row(idx), rhs_vecs)
+            ))
+            defs.append(def_)
+            continue
+
+        return defs
+
+    def lvt_inv(self, defs: typing.Iterable[TensorDef], rhs_vecs=None):
+        """Inverse a linear transformation of vectors.
+
+        This method internally utilizes :py:meth:`lvt_defs2mat` to get the
+        matrix for the transformation, then with the matrix inverted and
+        simplified symbolically, the inverse definition is cast back to the
+        definitions form.
+        """
+
+        mat, rhs_vecs = self.lvt_defs2mat(defs, rhs_vecs, ret_rhs=True)
+        # Here the input should have already been checked.
+        lhs_vecs = [i.lhs for i in defs]
+
+        inv_mat = mat.inv()
+        inv_mat.simplify()
+
+        return self.lvt_mat2defs(inv_mat, rhs_vecs, lhs_vecs)
 
 
 #
@@ -2828,19 +3462,109 @@ def _union(orig, new):
     return orig
 
 
-def _decompose_term(term):
+def _inters(orig, new):
+    """Make the interaction of two sets.
+
+    If the original is a None value, a new set will be created with elements
+    from the new set.  When both operands are None, the result is None.
+    """
+    if orig is None:
+        return new
+    elif new is None:
+        return orig
+    else:
+        orig &= new
+        return orig
+
+
+class _DecomposeSpecials:
+    """Container of special symbols during amplitude decomposition for merging.
+
+    When the merging is in constant symbol mode, a symbol is considered to be
+    contained only when it is not a constant symbol.  During generators mode, a
+    symbol is considered special only when it is one of the given generators.
+    In default mode, no symbol is considered special.
+    """
+
+    __slots__ = [
+        '_consts',
+        '_gens'
+    ]
+
+    def __init__(self, consts=None, gens=None):
+        """Initialize the container."""
+
+        self._consts = None
+        self._gens = None
+
+        if consts is not None:
+            self._consts = frozenset(consts)
+            assert gens is None
+        elif gens is not None:
+            self._gens = frozenset(gens)
+            assert consts is None
+
+    def __contains__(self, item):
+        """Test if a symbol requires special treatment."""
+        if self._consts is not None:
+            return item not in self._consts
+        elif self._gens is not None:
+            return item in self._gens
+        else:
+            # By default, we do not give special treatment to any symbol.
+            return False
+
+
+def _decompose_term(term, specials):
     """Decompose a term for simple merging.
 
     The given term will be decomposed into a pair, where the first field has the
-    summations, vectors, and product of factors containing at least one dummy.
-    And the second field contains factors involving no dummies.
+    the key for the merging, and the second field contains other factors.
+
+    The key has three parts, the summations, the vectors, and the special part
+    of the commutative part.  When specials are given, all indexed bases,
+    factors with dummies, and factors with special symbols will be put into the
+    third part.  When a None is given, nothing will be put there.
     """
 
-    factors, coeff = term.amp_factors
+    # To distinguish ranges with the same label but different bounds.
+    sums = tuple(
+        (dumm, range_.args) for dumm, range_ in term.sums
+    )
+    amp = term.amp
+
+    if specials is None:
+        coeff = amp
+        factor = 1
+    else:
+        factor = 1
+        coeff = 1
+        all_factors = amp.args if isinstance(amp, Mul) else (amp,)
+        for i in all_factors:
+            symbs = i.atoms(Symbol)
+            if len(symbs) == 0:
+                coeff *= i
+            elif isinstance(i, Indexed) or i in specials or any(
+                    j in specials for j in symbs
+            ):
+                factor *= i
+            else:
+                coeff *= i
+            continue
     return (
-        (term.sums, term.vecs, prod_(factors)),
+        (sums, term.vecs, factor),
         coeff
     )
+
+
+def _recover_term(state):
+    """Recover a term from a merging state."""
+
+    key, coeff = state
+    sums = tuple(
+        (dumm, Range(*range_args)) for dumm, range_args in key[0]
+    )
+    return Term(sums, coeff * key[2], key[1])
 
 
 def _is_nonzero(term):
@@ -2851,3 +3575,27 @@ def _is_nonzero(term):
 def _resolve_default_range(_, range_):
     """Resolve any expression to the given range."""
     return range_
+
+
+class _Decred(int):
+    """Placeholder objects which cannot be created by users.
+
+    Instances of this class can be used as placeholders ensure that it is not
+    something created by the user with special meaning.  It subclasses int so
+    that it can be used in places where ordering and equality comparison is
+    needed.
+    """
+    __slots__ = []
+
+
+def _simplify_symbolic_sum(expr, **_):
+    """Try to simplify a symbolic summation of one dummy by SymPy.
+
+    This is the only default way of simplifying internal summations.
+    """
+
+    assert len(expr.args) == 2
+
+    return eval_sum_symbolic(
+        expr.args[0].simplify(), expr.args[1]
+    )

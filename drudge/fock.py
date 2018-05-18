@@ -11,7 +11,8 @@ import warnings
 
 from pyspark import RDD
 from sympy import (
-    KroneckerDelta, IndexedBase, Expr, Symbol, Rational, symbols, conjugate
+    KroneckerDelta, IndexedBase, Expr, Symbol, Rational, symbols, conjugate,
+    factorial
 )
 
 from ._tceparser import parse_tce_out
@@ -192,7 +193,10 @@ class FockDrudge(WickDrudge):
         """
 
         step1 = super().normal_order(terms, **kwargs)
-        return super().normal_order(step1, **kwargs)
+        res = super().normal_order(step1, **kwargs)
+        if self._exch == FERMI:
+            res = res.filter(_is_not_zero_by_nilp)
+        return res
 
     @staticmethod
     def dagger(tensor: Tensor, real=False):
@@ -264,12 +268,6 @@ class FockDrudge(WickDrudge):
 
         n_body = int(n_body)
 
-        if n_body < 2:
-            raise ValueError(
-                'Invalid body count', n_body,
-                'expecting a number greater than one'
-            )
-
         n_body2 = n_body if n_body2 is None else int(n_body2)
         n_slots = n_body + n_body2
 
@@ -277,17 +275,18 @@ class FockDrudge(WickDrudge):
         cycl_accs = [
             NEG if self._exch == FERMI and i % 2 == 0 else IDENT
             for i in [n_body, n_body2]
-        ]  # When n_body2 is zero, this value is kinda wrong but not used.
+        ]  # When either body is zero, this value is kinda wrong but not used.
 
         gens = []
 
-        second_half = list(range(n_body, n_slots))
-        gens.append(Perm(
-            self._form_cycl(0, n_body) + second_half, cycl_accs[0]
-        ))
-        gens.append(Perm(
-            self._form_transp(0, n_body) + second_half, transp_acc
-        ))
+        if n_body > 1:
+            second_half = list(range(n_body, n_slots))
+            gens.append(Perm(
+                self._form_cycl(0, n_body) + second_half, cycl_accs[0]
+            ))
+            gens.append(Perm(
+                self._form_transp(0, n_body) + second_half, transp_acc
+            ))
 
         if n_body2 > 1:
             first_half = list(range(0, n_body))
@@ -458,6 +457,16 @@ def _get_dagger(term: Term, real: bool):
     )
 
 
+def _is_not_zero_by_nilp(term: Term):
+    """Test if a term is not zero by nilpotency of the operators.
+    """
+    vecs = term.vecs
+    return all(
+        vecs[i] != vecs[i + 1]
+        for i in range(0, len(vecs) - 1)
+    )
+
+
 #
 # Detailed problems
 # -----------------
@@ -576,6 +585,9 @@ class GenMBDrudge(FockDrudge):
             The indexed base for the amplitude in the one-body part of the
             Hamiltonian.  It will also be added to the name archive.
 
+            For developers: if it is given as None, the Hamiltonian will not be
+            built.
+
         two_body
             The indexed base for the two-body part of the Hamiltonian.  It will
             also be added to the name archive.
@@ -586,6 +598,12 @@ class GenMBDrudge(FockDrudge):
         """
 
         super().__init__(*args, exch=exch, **kwargs)
+
+        #
+        # Setting configuration.
+        #
+
+        self.default_einst = True
 
         #
         # Create the field operator
@@ -600,13 +618,12 @@ class GenMBDrudge(FockDrudge):
 
         self.set_name(**{
             str(op) + '_': an,
-            str(op) + '_dag': cr
+            str(op) + '_dag': cr,
+            str(op) + 'dag_': cr
         })
 
         #
-        # Hamiltonian creation
-        #
-        # Other aspects of the model will also be set during this stage.
+        # Ranges, dummies, and spins.
         #
 
         orb_ranges = []
@@ -671,7 +688,15 @@ class GenMBDrudge(FockDrudge):
         orb_sums = [(i, orb_ranges) for i in orb_dumms]
         spin_sums = [(i, spin_range) for i in spin_dumms]
 
+        #
         # Actual Hamiltonian building.
+        #
+        # It is disabled by a None one-body part.  Nothing should come after
+        # this.
+        #
+
+        if one_body is None:
+            return
 
         self.one_body = one_body
         self.set_name(one_body)  # No symmetry for it.
@@ -682,8 +707,8 @@ class GenMBDrudge(FockDrudge):
 
         if has_spin:
             one_body_ops = (
-                cr[orb_dumms[0], spin_dumms[0]] *
-                an[orb_dumms[1], spin_dumms[0]]
+                    cr[orb_dumms[0], spin_dumms[0]] *
+                    an[orb_dumms[1], spin_dumms[0]]
             )
         else:
             one_body_ops = cr[orb_dumms[0]] * an[orb_dumms[1]]
@@ -706,15 +731,15 @@ class GenMBDrudge(FockDrudge):
 
         if has_spin:
             two_body_ops = (
-                cr[orb_dumms[0], spin_dumms[0]] *
-                cr[orb_dumms[1], spin_dumms[1]] *
-                an[orb_dumms[3], spin_dumms[1]] *
-                an[orb_dumms[2], spin_dumms[0]]
+                    cr[orb_dumms[0], spin_dumms[0]] *
+                    cr[orb_dumms[1], spin_dumms[1]] *
+                    an[orb_dumms[3], spin_dumms[1]] *
+                    an[orb_dumms[2], spin_dumms[0]]
             )
         else:
             two_body_ops = (
-                cr[orb_dumms[0]] * cr[orb_dumms[1]] *
-                an[orb_dumms[3]] * an[orb_dumms[2]]
+                    cr[orb_dumms[0]] * cr[orb_dumms[1]] *
+                    an[orb_dumms[3]] * an[orb_dumms[2]]
             )
 
         two_body_ham = self.sum(
@@ -727,8 +752,6 @@ class GenMBDrudge(FockDrudge):
 
         simpled_ham = orig_ham.simplify()
         self.ham = simpled_ham
-
-        self.default_einst = True
 
 
 class PartHoleDrudge(GenMBDrudge):
@@ -771,11 +794,14 @@ class PartHoleDrudge(GenMBDrudge):
     DEFAULT_HOLE_DUMMS = tuple(Symbol(i) for i in 'ijkl') + tuple(
         Symbol('i{}'.format(i)) for i in range(50)
     )
+    DEFAULT_ORB_DUMMS = tuple(Symbol(i) for i in 'pqrs') + tuple(
+        Symbol('p{}'.format(i)) for i in range(50)
+    )
 
     def __init__(self, *args, op_label='c',
                  part_orb=(Range('V', 0, Symbol('nv')), DEFAULT_PART_DUMMS),
                  hole_orb=(Range('O', 0, Symbol('no')), DEFAULT_HOLE_DUMMS),
-                 spin=(),
+                 all_orb_dumms=DEFAULT_ORB_DUMMS, spin=(),
                  one_body=IndexedBase('t'), two_body=IndexedBase('u'),
                  fock=IndexedBase('f'),
                  dbbar=True, **kwargs):
@@ -788,6 +814,12 @@ class PartHoleDrudge(GenMBDrudge):
                          orb=(part_orb, hole_orb), spin=spin,
                          one_body=one_body, two_body=two_body, dbbar=dbbar,
                          **kwargs)
+
+        self.all_orb_dumms = tuple(all_orb_dumms)
+        self.set_name(*self.all_orb_dumms)
+        self.add_resolver({
+            i: (self.part_range, self.hole_range) for i in all_orb_dumms
+        })
 
         full_ham = self.ham
         full_ham.cache()
@@ -1010,3 +1042,267 @@ class RestrictedPartHoleDrudge(SpinOneHalfPartHoleDrudge):
             (sigma, spin_range), self.cr[p, sigma] * self.an[q, sigma]
         ))
         self.set_name(e_=self.e_)
+
+
+class BogoliubovDrudge(GenMBDrudge):
+    r"""Drudge for general Bogoliubov problems.
+
+    Based on :py:class:`GenMBDrudge`, this class performs the Bogoliubov
+    transformation to the Hamiltonian as defined in [RS1980]_.  Here the
+    creation and annihilation operators of bare fermions :math:`c` and
+    :math:`c^\dagger` are going to be substituted as
+
+    .. math::
+
+        c^\dagger_l &= \sum_k u^*_{lk} \beta^\dagger_k + v_{lk} \beta_k \\
+        c_l &= \sum_k u_{lk} \beta_k + v^*_{lk} \beta^\dagger_k \\
+
+    which comes from the inversion of
+
+    .. math::
+
+        \beta^\dagger_k = \sum_l u_{lk} c^\dagger_l v_{lk} c_l
+
+    Then the Hamiltonian is going to be rewritten with matrix elements formatted
+    according to the given format.  During the rewritten, the new matrix
+    elements follows the normalization convention as in [SDHJ2015]_.
+
+    .. [RS1980] P Ring and P Schuck, The Nuclear Many-Body Problem,
+       Springer-Verlag 1980
+
+    .. [SDHJ2015] A Signoracci, T Duguet, G Hagen, and G R Jansen, Ab initio
+       Bogoliubov coupled cluster theory for open-shell nuclei, Phys Rev C 91
+       (2015), 064320
+
+    Parameters
+    ----------
+
+    ctx
+        The Spark context.
+
+    u_base
+        The indexed base for the :math:`U` part of the Bogoliubov
+        transformation.
+
+    v_base
+        The indexed base for the :math:`V` part.
+
+    one_body
+        The indexed base for the one-body part of the original Hamiltonian.
+
+    two_body
+        The indexed base for the two-body part of the original Hamiltonian.
+
+    qp_op_label
+        The label for the quasi-particle operators.
+
+    ham_me_format
+        The format for the matrix elements of the rewritten Hamiltonian.  It is
+        going to be formatted with the creation and annihilation order of the
+        quasi-particles to get the name for the indexed base of the Hamiltonian
+        matrix elements.
+
+    kwargs
+        All the rest of the keyword arguments are given to the base class.
+
+    """
+
+    DEFAULT_P_DUMMS = tuple(
+        Symbol('l{}'.format(i)) for i in range(1, 100)
+    )
+    DEFAULT_QP_DUMMS = tuple(
+        Symbol('k{}'.format(i)) for i in range(1, 100)
+    )
+
+    def __init__(
+            self, ctx, p_range=Range('L'), p_dumms=DEFAULT_P_DUMMS,
+            qp_range=Range('Q', 0, Symbol('N')), qp_dumms=DEFAULT_QP_DUMMS,
+            u_base=IndexedBase('u'), v_base=IndexedBase('v'),
+            one_body=IndexedBase('epsilon'), two_body=IndexedBase('vbar'),
+            dbbar=True, qp_op_label=r'\beta', ham_me_format='H^{{{}{}}}',
+            ham_me_name_format='H{}{}',
+            **kwargs
+    ):
+        """Initialize the drudge object."""
+
+        super().__init__(
+            ctx, orb=((p_range, p_dumms),),
+            one_body=one_body, two_body=two_body, dbbar=dbbar, **kwargs
+        )
+        self.set_dumms(qp_range, qp_dumms)
+        self.add_resolver_for_dumms()
+        self.p_range = p_range
+        self.p_dumms = p_dumms
+        self.qp_range = qp_range
+        self.qp_dumms = qp_dumms
+
+        qp_op = Vec(qp_op_label)
+        qp_cr = qp_op[CR]
+        qp_an = qp_op[AN]
+        self.qp_op = qp_op
+        self.qp_cr = qp_cr
+        self.qp_an = qp_an
+
+        qp_op_str = str(qp_op).replace('\\', "")
+        self.set_name(**{
+            qp_op_str + '_': qp_an,
+            qp_op_str + '_dag': qp_cr,
+            qp_op_str + 'dag_': qp_cr
+        })
+
+        self.u_base = u_base
+        self.v_base = v_base
+
+        cr = self.cr
+        an = self.an
+        l = p_dumms[0]
+        k = qp_dumms[0]
+        self.f_in_qp = [
+            self.define(cr[l], self.einst(
+                conjugate(u_base[l, k]) * qp_cr[k] + v_base[l, k] * qp_an[k]
+            )),
+            self.define(an[l], self.einst(
+                u_base[l, k] * qp_an[k] + conjugate(v_base[l, k]) * qp_cr[k]
+            ))
+        ]
+
+        orig_ham = self.ham
+        rewritten, ham_mes = self.write_in_qp(
+            orig_ham, ham_me_format, name_format=ham_me_name_format
+        )
+        self.orig_ham = orig_ham
+        self.ham = rewritten
+        self.ham_mes = ham_mes
+
+        self.set_tensor_method(
+            'eval_bogoliubov_vev', self.eval_bogoliubov_vev
+        )
+
+    def write_in_qp(
+            self, tensor: Tensor, format_: str, name_format=None, set_symms=True
+    ):
+        """Write the given expression in terms of quasi-particle operators.
+
+        The given expression will be rewritten in terms of the quasi-particle
+        operators.  Then the possibly complex matrix elements are all going to
+        be replaced by simple tensors, whose names can be tuned.
+
+        Note that for a term with creation order :math:`m` and annihilation
+        order :math:`n`, the term carries a normalization of division over
+        :math:`m! n!`.
+
+        Parameters
+        ----------
+
+        tensor
+            The expression to be rewritten.  It should be an expression in terms
+            of the physical fermion operators.
+
+        format_
+            The format string to be used for the new matrix elements, which is
+            going to be formatted with the quasi-particle creation and
+            annihilation orders.
+
+        name_format
+            With the same usage as ``format_``, when it is given as a string, it
+            will be used to add the new indexed bases into the name archive.
+
+        set_symms
+            If automatic symmetries are going to be set for the new matrix
+            elements.
+
+        Return
+        ------
+
+        The rewritten form of the expression, as well as a list of tensor
+        definitions for the new matrix elements.
+
+        """
+
+        terms = tensor.subst_all(self.f_in_qp).simplify().local_terms
+
+        # Internal book keeping, maps the cr/an order to lhs and the rhs terms
+        # of the definition of the new matrix element.
+        transf = {}
+
+        rewritten_terms = []
+
+        for term in terms:
+            cr_order = 0
+            an_order = 0
+            indices = []
+            for i in term.vecs:
+                if len(i.indices) != 2:
+                    raise ValueError(
+                        'Invalid operator to rewrite, one index expected', i
+                    )
+                char, index = i.indices
+                if char == CR:
+                    assert an_order == 0
+                    cr_order += 1
+                elif char == AN:
+                    an_order += 1
+                else:
+                    assert False
+
+                indices.append(index)
+                continue
+
+            norm = factorial(cr_order) * factorial(an_order)
+            order = (cr_order, an_order)
+            tot_order = cr_order + an_order
+
+            base = IndexedBase(format_.format(*order))
+            if name_format is not None:
+                base_name = name_format.format(*order)
+                self.set_name(**{base_name: base})
+
+            indices[cr_order:tot_order] = reversed(indices[cr_order:tot_order])
+            if tot_order > 0:
+                new_amp = base[tuple(indices)]
+            else:
+                new_amp = base.label
+            orig_amp = term.amp
+
+            new_sums = []
+            wrapped_sums = []
+            for i in term.sums:
+                if new_amp.has(i[0]):
+                    new_sums.append(i)
+                else:
+                    wrapped_sums.append(i)
+                continue
+
+            def_term = Term(
+                sums=tuple(wrapped_sums), amp=orig_amp * norm, vecs=()
+            )
+
+            if order in transf:
+                entry = transf[order]
+                assert entry[0] == new_amp
+                entry[1].append(def_term)
+            else:
+                transf[order] = (new_amp, [def_term])
+                rewritten_terms.append(Term(
+                    sums=tuple(new_sums), amp=new_amp / norm, vecs=term.vecs
+                ))
+                if set_symms and (cr_order > 1 or an_order > 1):
+                    self.set_dbbar_base(base, cr_order, an_order)
+
+            continue
+
+        defs = [
+            self.define(lhs, self.create_tensor(rhs_terms))
+            for lhs, rhs_terms in transf.values()
+        ]
+
+        return self.create_tensor(rewritten_terms), defs
+
+    def eval_bogoliubov_vev(self, tensor: Tensor):
+        """Evaluate expectation value with respect to Bogoliubov vacuum.
+
+        This is just an alias to the actual :py:meth:`FockDrudge.eval_phys_vev`
+        method to avoid confusion.  And it is set as a tensor method by the same
+        name.
+        """
+        return self.eval_phys_vev(tensor)
