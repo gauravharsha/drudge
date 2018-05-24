@@ -198,9 +198,7 @@ def _swap_su4(vec1: Vec, vec2: Vec, depth=None, *,spec: _SU4Spec):
     if char1 == _YPP:
         
         if char2 == _YPP:
-            if key1 < key2:
-                return None
-            elif key1 > key2:
+            if key1 < key2: return None elif key1 > key2:
                 return _UNITY, _NOUGHT
             else:
                 return None
@@ -613,7 +611,7 @@ def _parse_vec(vec, spec: _SU4Spec):
     elif base == spec.yzm:
         char = _YZM
     else:
-        raise ValueError('Unexpected vector for SU2 algebra', vec)
+        raise ValueError('Unexpected vector for SU4 algebra', vec)
     
     indices = vec.indices
     keys = tuple(sympy_key(i) for i in indices)
