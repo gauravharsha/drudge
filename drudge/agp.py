@@ -3,7 +3,8 @@ Drudge for reduced AGP - PBCS Hamiltonian.
 """
 import collections, functools, operator
 
-from sympy import Integer, Symbol, IndexedBase, KroneckerDelta
+from sympy import Integer, Symbol, IndexedBase, KroneckerDelta, factorial
+from sympy.utilities.iterables import (has_dups, default_sort_key)
 
 from drudge import Tensor
 from drudge.fock import PartHoleDrudge, SpinOneHalfPartHoleDrudge
@@ -80,6 +81,14 @@ class ProjectedBCSDrudge(GenQuadDrudge):
             i: (self.part_range, self.hole_range) for i in all_orb_dumms
         })
 
+        self.cartan = cartan
+        self.raise_ = raise_
+        self.lower = lower
+
+        self.upar = upar
+        self.vpar = vpar
+        self.zpar = zpar
+
         # Make additional name definition for the operators.
         self.set_name(**{
             cartan.label[0]+'_':cartan,
@@ -120,18 +129,27 @@ class ProjectedBCSDrudge(GenQuadDrudge):
     def get_vev(self,h_tsr: Tensor, Ntot: Symbol, Npart: Symbol):
         """Function to evaluate the expectation value of a normal
         ordered tensor 'h_tsr' with respect to the projected BCS
-        ground state"""
+        ground state
+            h_tsr = tensor whose VEV is to be evaluated
+            Ntot = total number of orbitals available
+            Npart = Number of particles
+        """
         ctan = self.cartan
+        
 
         def vev_of_term(term):
             """Return the VEV of a given term"""
             vecs = term.vecs
             t_amp = term.amp
-            if all(i.base==ctan for i in vecs):
-                for i in vecs:
-                    t_amp = t_amp*zpar[i]*zpar[i]*"""something"""
-                """falana falana"""
+            for i in vecs:
+                if i.base==ctan:
+                    t_amp = t_amp*self.zpar[i.indices]*self.zpar[i.indices]
+                else:
+                    return []
+            lk = len(vecs)
+            t_amp = t_amp*factorial(Ntot - lk)/factorial(Ntot)*(2**lk)
             return [Term(sums=term.sums, amp = t_amp, vecs=())]
+        return h_tsr.bind(vev_of_term)
 
     #
     # Additional customization of the simplification
@@ -230,6 +248,8 @@ def _swap_agp(vec1: Vec, vec2: Vec, depth=None, *,spec: _AGPSpec):
         if char2 == _RAISE:
             p = indice2[0]
             q = indice2[1]
+            if p==q:
+                return [],[]
             del_rq = KroneckerDelta(r,q)
             del_rp = KroneckerDelta(r,p)
             expr1 = (del_rq*(1-del_rp))*sig[r,p]*(
@@ -251,18 +271,27 @@ def _swap_agp(vec1: Vec, vec2: Vec, depth=None, *,spec: _AGPSpec):
 
         p = indice1[0]
         q = indice1[1]
+        if p==q:
+            return [],[]
 
         if char2 == _RAISE:
             r = indice2[0]
             s = indice2[1]
+            if r==s:
+                return [],[]
+            del_pr = KroneckerDelta(p,r)
+            del_qs = KroneckerDelta(q,s)
+            del_ps = KroneckerDelta(p,s)
+            del_qr = KroneckerDelta(q,r)
+            
             def D_Ddag_comm_expr(a,b,c,d):
                 del_ac = KroneckerDelta(a,c)
                 del_bd = KroneckerDelta(b,d)
                 exprn = del_bd*(1-del_ac)*sig[a,c]*( (vpar[c]*upar[c])*(
-                    (vpar[a]*upar[b])**2 - (vpar[b]*upar[a])**2 )*self.lower[a,c] +
+                    (vpar[a]*upar[b])**2 - (vpar[b]*upar[a])**2 )*spec.lower[a,c] +
                     (vpar[a]*upar[a])*(
                         (vpar[c]*upar[b])**2 - (vpar[b]*upar[c])**2)*(
-                            self.raise_[a,c]
+                            spec.raise_[a,c]
                         )
                     ) 
                 return exprn
@@ -305,6 +334,7 @@ _CARTAN = 1
 _LOWER = 2
 
 _UNITY = 1
+_ZERO = 0
 
 def _parse_vec(vec, spec: _AGPSpec):
     """Get the character, lattice indices, and the indices of keys of vector.
