@@ -8,7 +8,7 @@ from sympy.utilities.iterables import (has_dups, default_sort_key)
 
 from drudge import Tensor
 from drudge.fock import PartHoleDrudge, SpinOneHalfPartHoleDrudge
-from drudge.canon import IDENT
+from drudge.canon import IDENT,NEG
 from drudge.canonpy import Perm
 from drudge.term import Vec, Range, Term
 from drudge.utils import sympy_key
@@ -57,9 +57,7 @@ class ProjectedBCSDrudge(GenQuadDrudge):
             hole_range=Range('O', 0, Symbol('no')),
             hole_dumms=PartHoleDrudge.DEFAULT_HOLE_DUMMS,
             all_orb_dumms=PartHoleDrudge.DEFAULT_ORB_DUMMS,
-            upar=IndexedBase('u'), vpar=IndexedBase('v'),
-            zpar=IndexedBase('z'), sig=IndexedBase(r'\sigma'),
-            energies=IndexedBase('epsilon'), interact=IndexedBase('G'),
+            zpar=IndexedBase(r'\eta'), sig=IndexedBase(r'\sigma'),
             cartan=DEFAULT_CARTAN, raise_=DEFAULT_RAISE, lower=DEFAULT_LOWER,
             **kwargs
     ):
@@ -81,13 +79,29 @@ class ProjectedBCSDrudge(GenQuadDrudge):
             i: (self.part_range, self.hole_range) for i in all_orb_dumms
         })
 
+        # Set the operator attributes
+
         self.cartan = cartan
         self.raise_ = raise_
         self.lower = lower
 
-        self.upar = upar
-        self.vpar = vpar
+        self.set_symm(self.raise_,
+            Perm([1,0],NEG),
+            valence=2
+        )
+        self.set_symm(self.lower,
+            Perm([1,0],NEG),
+            valence=2
+        )
+
+        # Set the indexed objects attributes
+
         self.zpar = zpar
+        self.sig = sig
+        self.set_symm(self.sig,
+            Perm([1,0],NEG),
+            valence=2
+        )
 
         # Make additional name definition for the operators.
         self.set_name(**{
@@ -97,29 +111,17 @@ class ProjectedBCSDrudge(GenQuadDrudge):
         })
 
         self.set_name(cartan, lower, Ddag=raise_)
+        
+        # Defining spec for passing to an external function - the Swapper
         spec = _AGPSpec(
                 cartan=cartan,raise_=raise_,lower=lower,
-                upar=upar,vpar=vpar,sig=sig
+                zpar=zpar,sig=sig
         )
 
-        self.set_symm(sig,
-            Perm([1,0],IDENT),
-            valence=2
-        )
         self._spec = spec
 
+        # set the Swapper
         self._swapper = functools.partial(_swap_agp, spec=spec)
-
-        # Define the Hamiltonian.
-        # gen_idx, gen_idx2 = self.all_orb_dumms[:2]
-        # ham = self.einst(
-        #     energies[gen_idx] * cartan[gen_idx] +
-        #     interact[gen_idx, gen_idx2] * raise_[gen_idx] * lower[gen_idx2]
-        # )
-        # self.ham = ham.simplify()
-
-        # Set additional tensor methods.
-        # self.set_tensor_method('eval_vev', self.eval_vev)
 
     @property
     def swapper(self) -> GenQuadDrudge.Swapper:
@@ -135,7 +137,7 @@ class ProjectedBCSDrudge(GenQuadDrudge):
             Npart = Number of particles
         """
         ctan = self.cartan
-        
+        zpar = self.zpar
 
         def vev_of_term(term):
             """Return the VEV of a given term"""
@@ -143,7 +145,7 @@ class ProjectedBCSDrudge(GenQuadDrudge):
             t_amp = term.amp
             for i in vecs:
                 if i.base==ctan:
-                    t_amp = t_amp*self.zpar[i.indices]*self.zpar[i.indices]
+                    t_amp = t_amp*zpar[i.indices]*zpar[i.indices]
                 else:
                     return []
             lk = len(vecs)
@@ -151,60 +153,47 @@ class ProjectedBCSDrudge(GenQuadDrudge):
             return [Term(sums=term.sums, amp = t_amp, vecs=())]
         return h_tsr.bind(vev_of_term)
 
-    #
-    # Additional customization of the simplification
-    #
+    def agp_simplify(self, arg, **kwargs):
+        """Make simplification for both SymPy expressions and tensors.
+        
+        This method is mostly designed to be used in drudge scripts.  But it
+        can also be used inside Python scripts for convenience.
 
-    # def normal_order(self, terms, **kwargs):
-    #     """Take the operators into normal order.
+        The actual simplification is dispatched based on the type of the given
+        argument. Simple SymPy simplification for SymPy expressions, drudge
+        simplification for drudge tensors or tensor definitions, or the argument
+        will be attempted to be converted into a tensor.
 
-    #     Here, in addition to the common normal-ordering operation, we remove any
-    #     term with a cartan operator followed by an lowering operator with the
-    #     same index, and any term with a raising operator followed by a cartan
-    #     operator with the same index.
+        """
+        ras = self.raise_
+        lo = self.lower
+        def is_asym(term):
+            """Returns the non-trivial terms by considering anti-symmetric property"""
+            vecs = term.vecs
+            for i in vecs:
+                if (i.base==ras) or (i.base==lo):
+                    if len(i.indices)!=2:
+                        raise ValueError(
+                                'Invalid length of indices for AGP generators on lattice',
+                                (i),
+                                'Inappropriate rank of indices with the input operator'
+                        )
+                    if i.indices[0]==i.indices[1]:
+                        return []
+                        break
+            return [Term(sums=term.sums, amp = term.amp, vecs=term.vecs)]
 
-    #     """
-
-    #     noed = super().normal_order(terms, **kwargs)
-    #     return noed.filter(functools.partial(
-    #         _nonzero_by_cartan,
-    #         raise_=self.raise_, cartan=self.cartan, lower=self.lower
-    #     ))
-
-    #
-    # Vacuum expectation value
-    #
-
-# def _nonzero_by_cartan(term: Term, raise_, cartan, lower):
-#     """If the term is zero because of the cartan in it."""
-# 
-#     raise_indices = set()
-#     cartan_indices = set()
-# 
-#     for vec in term.vecs:
-#         base = vec.base
-#         indices = vec.indices
-# 
-#         if base == raise_:
-#             raise_indices.add(indices)
-#         elif base == cartan:
-#             if indices in raise_indices:
-#                 return False
-#             cartan_indices.add(indices)
-#         elif base == lower:
-#             if indices in cartan_indices:
-#                 return False
-# 
-#         continue
-# 
-#     return True
+        if isinstance(arg,Tensor):
+            arg2 = arg.bind(is_asym)
+            return arg2.simplify(**kwargs)
+        else:
+            return self.sum(arg).simplify(**kwargs)
 
 _AGPSpec = collections.namedtuple('_AGPSpec',[
     'cartan',
     'raise_',
     'lower',
-    'upar',
-    'vpar',
+    'zpar',
     'sig'
 ])
 
@@ -233,8 +222,7 @@ def _swap_agp(vec1: Vec, vec2: Vec, depth=None, *,spec: _AGPSpec):
             'Inappropriate rank of indices with the input operator'
         )
 
-    vpar = spec.vpar
-    upar = spec.upar
+    zpar = spec.zpar
     sig = spec.sig
 
     if char1 == _RAISE:
@@ -248,20 +236,12 @@ def _swap_agp(vec1: Vec, vec2: Vec, depth=None, *,spec: _AGPSpec):
         if char2 == _RAISE:
             p = indice2[0]
             q = indice2[1]
-            if p==q:
-                return [],[]
             del_rq = KroneckerDelta(r,q)
             del_rp = KroneckerDelta(r,p)
-            expr1 = (del_rq*(1-del_rp))*sig[r,p]*(
-                    ( (vpar[r]*upar[p])**2 + (vpar[p]*upar[r])**2 )*spec.raise_[r,p]
-                    + 2*vpar[r]*vpar[p]*upar[r]*upar[p]*spec.lower[r,p]
-            )
-            expr2 = (del_rp*(1-del_rq))*sig[r,q]*(
-                    ( (vpar[r]*upar[q])**2 + (vpar[q]*upar[r])**2 )*spec.raise_[r,q]
-                    + 2*vpar[r]*vpar[q]*upar[r]*upar[q]*spec.lower[r,q]
-            )
+            expr = _TWO*zpar[p]*zpar[q]*spec.lower[p,q] + (zpar[p]*zpar[p] + zpar[q]*zpar[q])*spec.raise_[p,q]
+            expr = expr*sig[p,q]*(del_rq - del_rp)
 
-            return _UNITY, expr1 - expr2
+            return _UNITY, expr
         
         else:
 
@@ -271,14 +251,10 @@ def _swap_agp(vec1: Vec, vec2: Vec, depth=None, *,spec: _AGPSpec):
 
         p = indice1[0]
         q = indice1[1]
-        if p==q:
-            return [],[]
 
         if char2 == _RAISE:
             r = indice2[0]
             s = indice2[1]
-            if r==s:
-                return [],[]
             del_pr = KroneckerDelta(p,r)
             del_qs = KroneckerDelta(q,s)
             del_ps = KroneckerDelta(p,s)
@@ -287,20 +263,15 @@ def _swap_agp(vec1: Vec, vec2: Vec, depth=None, *,spec: _AGPSpec):
             def D_Ddag_comm_expr(a,b,c,d):
                 del_ac = KroneckerDelta(a,c)
                 del_bd = KroneckerDelta(b,d)
-                exprn = del_bd*(1-del_ac)*sig[a,c]*( (vpar[c]*upar[c])*(
-                    (vpar[a]*upar[b])**2 - (vpar[b]*upar[a])**2 )*spec.lower[a,c] +
-                    (vpar[a]*upar[a])*(
-                        (vpar[c]*upar[b])**2 - (vpar[b]*upar[c])**2)*(
-                            spec.raise_[a,c]
-                        )
-                    ) 
+                exprn = del_ac*(1-del_bd)*sig[d,b]*( \
+                        zpar[d]*( zpar[a]*zpar[a] - zpar[b]*zpar[b] )*spec.lower[b,d] + \
+                        zpar[b]*( zpar[a]*zpar[a] - zpar[d]*zpar[d] )*spec.raise_[b,d] \
+                        ) + del_ac*del_bd*( zpar[b]*zpar[b] - zpar[a]*zpar[a] )*spec.cartan[a]
                 return exprn
-            expr1 = ((vpar[p]*upar[q])**2 - (vpar[q]*upar[p])**2)*(
-                del_pr*del_qs - del_qr*del_ps)*(spec.cartan[p] - spec.cartan[q])
-            expr2 = D_Ddag_comm_expr(p,q,r,s)
-            expr3 = D_Ddag_comm_expr(q,p,s,r)
-            expr4 = -D_Ddag_comm_expr(p,q,s,r)
-            expr5 = -D_Ddag_comm_expr(q,p,r,s)
+            expr1 = D_Ddag_comm_expr(p,q,r,s)
+            expr2 = D_Ddag_comm_expr(q,p,s,r)
+            expr3 = -D_Ddag_comm_expr(p,q,s,r)
+            expr4 = -D_Ddag_comm_expr(q,p,r,s)
 
             tot_comm = expr1 + expr2 + expr3 + expr4
 
@@ -308,18 +279,12 @@ def _swap_agp(vec1: Vec, vec2: Vec, depth=None, *,spec: _AGPSpec):
 
         elif char2 == _CARTAN:
             r = indice2[0]
-            del_rp = KroneckerDelta(r,p)
             del_rq = KroneckerDelta(r,q)
-            expr1 = (del_rq*(1-del_rp))*sig[r,p]*(
-                    ( (vpar[r]*upar[p])**2 + (vpar[p]*upar[r])**2 )*spec.lower[r,p]
-                    + 2*vpar[r]*vpar[p]*upar[r]*upar[p]*spec.raise_[r,p]
-            )
-            expr2 = (del_rp*(1-del_rq))*sig[r,q]*(
-                    ( (vpar[r]*upar[q])**2 + (vpar[q]*upar[r])**2 )*spec.lower[r,q]
-                    + 2*vpar[r]*vpar[q]*upar[r]*upar[q]*spec.raise_[r,q]
-            )
+            del_rp = KroneckerDelta(r,p)
+            expr = _TWO*zpar[p]*zpar[q]*spec.raise_[p,q] + (zpar[p]*zpar[p] + zpar[q]*zpar[q])*spec.lower[p,q]
+            expr = expr*sig[p,q]*(del_rq - del_rp)
             
-            return _UNITY, expr1 - expr2
+            return _UNITY, expr
 
         else:
 
@@ -333,8 +298,9 @@ _RAISE = 0
 _CARTAN = 1
 _LOWER = 2
 
-_UNITY = 1
-_ZERO = 0
+_UNITY = Integer(1)
+_NOUGHT = Integer(0)
+_TWO = Integer(2)
 
 def _parse_vec(vec, spec: _AGPSpec):
     """Get the character, lattice indices, and the indices of keys of vector.

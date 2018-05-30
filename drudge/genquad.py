@@ -143,6 +143,7 @@ def _sort_vec(no_state: _NOState, swapper: GenQuadDrudge.Swapper, resolvers):
         return move2front
 
     phase = sympify(swap_res[0])
+    print(phase)
     comm_terms = []
     for i in parse_terms(swap_res[1]):
         comm_terms.extend(i.expand())
