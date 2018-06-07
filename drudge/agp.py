@@ -7,7 +7,7 @@ from sympy import Integer, Symbol, IndexedBase, KroneckerDelta, factorial
 from sympy.utilities.iterables import (has_dups, default_sort_key)
 
 from drudge import Tensor
-from drudge.fock import PartHoleDrudge, SpinOneHalfPartHoleDrudge
+from drudge import PartHoleDrudge, SpinOneHalfPartHoleDrudge
 from drudge.canon import IDENT,NEG
 from drudge.canonpy import Perm
 from drudge.term import Vec, Range, Term
@@ -107,7 +107,9 @@ class ProjectedBCSDrudge(GenQuadDrudge):
         self.set_name(**{
             cartan.label[0]+'_':cartan,
             raise_.label[0]+'_p':raise_,
-            lower.label[0]+'_m':lower
+            lower.label[0]+'_m':lower,
+            'sig':sig,
+            'zpar':zpar
         })
 
         self.set_name(cartan, lower, Ddag=raise_)
@@ -128,13 +130,12 @@ class ProjectedBCSDrudge(GenQuadDrudge):
         """Swapper for the new AGP Algebra."""
         return self._swapper
 
-    def get_vev(self,h_tsr: Tensor, Ntot: Symbol, Npart: Symbol):
+    def get_vev(self,h_tsr: Tensor, Ntot: Symbol):
         """Function to evaluate the expectation value of a normal
         ordered tensor 'h_tsr' with respect to the projected BCS
         ground state
             h_tsr = tensor whose VEV is to be evaluated
             Ntot = total number of orbitals available
-            Npart = Number of particles
         """
         ctan = self.cartan
         zpar = self.zpar
@@ -153,7 +154,7 @@ class ProjectedBCSDrudge(GenQuadDrudge):
             return [Term(sums=term.sums, amp = t_amp, vecs=())]
         return h_tsr.bind(vev_of_term)
 
-    def agp_simplify(self, arg, **kwargs):
+    def agp_simplify(self, arg, final_step=False, **kwargs):
         """Make simplification for both SymPy expressions and tensors.
         
         This method is mostly designed to be used in drudge scripts.  But it
@@ -181,10 +182,29 @@ class ProjectedBCSDrudge(GenQuadDrudge):
                     if i.indices[0]==i.indices[1]:
                         return []
                         break
-            return [Term(sums=term.sums, amp = term.amp, vecs=term.vecs)]
+            return [Term(sums=term.sums, amp=term.amp, vecs=term.vecs)]
+        
+        def p_no_cons(term):
+            """Checks for particle number conserving terms and returns
+            the non-trivial combinations"""
+            vecs = term.vecs
+            d_no = 0
+            ddag_no = 0
+            for i in vecs:
+                if i.base == ras:
+                    ddag_no = ddag_no + 1
+                elif i.base == lo:
+                    d_no = d_no + 1
+            if d_no == ddag_no:
+                return [Term(sums=term.sums, amp=term.amp, vecs=term.vecs)]
+            else:
+                return []
 
         if isinstance(arg,Tensor):
-            arg2 = arg.bind(is_asym)
+            arg2 = arg
+            if final_step==True:
+                arg2 = arg.bind(p_no_cons)
+            arg2 = arg2.bind(is_asym)
             return arg2.simplify(**kwargs)
         else:
             return self.sum(arg).simplify(**kwargs)
@@ -263,7 +283,7 @@ def _swap_agp(vec1: Vec, vec2: Vec, depth=None, *,spec: _AGPSpec):
             def D_Ddag_comm_expr(a,b,c,d):
                 del_ac = KroneckerDelta(a,c)
                 del_bd = KroneckerDelta(b,d)
-                exprn = del_ac*(1-del_bd)*sig[d,b]*( \
+                exprn = del_ac*sig[d,b]*( \
                         zpar[d]*( zpar[a]*zpar[a] - zpar[b]*zpar[b] )*spec.lower[b,d] + \
                         zpar[b]*( zpar[a]*zpar[a] - zpar[d]*zpar[d] )*spec.raise_[b,d] \
                         ) + del_ac*del_bd*( zpar[b]*zpar[b] - zpar[a]*zpar[a] )*spec.cartan[a]
