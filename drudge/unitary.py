@@ -102,14 +102,16 @@ class UnitaryGroupDrudge(GenQuadDrudge):
         N_ = agp_dr.cartan
         D_m = agp_dr.lower
         sig = agp_dr.sig
-        zpar = agp_dr.zpar
+        eta = agp_dr.eta
+        self.eta = eta
+        self.sig = sig
 
         gen_idx1, gen_idx2 = self.all_orb_dumms[:2]
 
         epq_def = self.define(
             ug_gen,gen_idx1,gen_idx2,
-            sig[gen_idx1,gen_idx2]*( zpar[gen_idx1]*D_m[gen_idx1,gen_idx2] + \
-                zpar[gen_idx2]*D_p[gen_idx1,gen_idx2] ) + \
+            sig[gen_idx1,gen_idx2]*( eta[gen_idx1]*D_m[gen_idx1,gen_idx2] + \
+                eta[gen_idx2]*D_p[gen_idx1,gen_idx2] ) + \
                 KroneckerDelta(gen_idx1,gen_idx2)*N_[gen_idx1]
         )
 

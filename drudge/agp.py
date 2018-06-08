@@ -45,7 +45,7 @@ class ProjectedBCSDrudge(GenQuadDrudge):
             # hole_dumms=PartHoleDrudge.DEFAULT_HOLE_DUMMS,
             all_orb_range=Range('A' ,0, Symbol('na')),
             all_orb_dumms=PartHoleDrudge.DEFAULT_ORB_DUMMS,
-            zpar=IndexedBase(r'\eta'), sig=IndexedBase(r'\sigma'),
+            eta=IndexedBase(r'\eta'), sig=IndexedBase(r'\sigma'),
             cartan=DEFAULT_CARTAN, raise_=DEFAULT_RAISE, lower=DEFAULT_LOWER,
             **kwargs
     ):
@@ -89,7 +89,7 @@ class ProjectedBCSDrudge(GenQuadDrudge):
 
         # Set the indexed objects attributes
 
-        self.zpar = zpar
+        self.eta = eta
         self.sig = sig
         self.set_symm(self.sig,
             Perm([1,0],NEG),
@@ -102,7 +102,7 @@ class ProjectedBCSDrudge(GenQuadDrudge):
             raise_.label[0]+'_p':raise_,
             lower.label[0]+'_m':lower,
             'sig':sig,
-            'zpar':zpar
+            'eta':eta
         })
 
         self.set_name(cartan, lower, Ddag=raise_)
@@ -110,7 +110,7 @@ class ProjectedBCSDrudge(GenQuadDrudge):
         # Defining spec for passing to an external function - the Swapper
         spec = _AGPSpec(
                 cartan=cartan,raise_=raise_,lower=lower,
-                zpar=zpar,sig=sig
+                eta=eta,sig=sig
         )
 
         self._spec = spec
@@ -131,7 +131,7 @@ class ProjectedBCSDrudge(GenQuadDrudge):
             Ntot = total number of orbitals available
         """
         ctan = self.cartan
-        zpar = self.zpar
+        eta = self.eta
 
         def vev_of_term(term):
             """Return the VEV of a given term"""
@@ -139,7 +139,7 @@ class ProjectedBCSDrudge(GenQuadDrudge):
             t_amp = term.amp
             for i in vecs:
                 if i.base==ctan:
-                    t_amp = t_amp*zpar[i.indices]*zpar[i.indices]
+                    t_amp = t_amp*eta[i.indices]*eta[i.indices]
                 else:
                     return []
             lk = len(vecs)
@@ -206,7 +206,7 @@ _AGPSpec = collections.namedtuple('_AGPSpec',[
     'cartan',
     'raise_',
     'lower',
-    'zpar',
+    'eta',
     'sig'
 ])
 
@@ -235,7 +235,7 @@ def _swap_agp(vec1: Vec, vec2: Vec, depth=None, *,spec: _AGPSpec):
             'Inappropriate rank of indices with the input operator'
         )
 
-    zpar = spec.zpar
+    eta = spec.eta
     sig = spec.sig
 
     if char1 == _RAISE:
@@ -251,7 +251,7 @@ def _swap_agp(vec1: Vec, vec2: Vec, depth=None, *,spec: _AGPSpec):
             q = indice2[1]
             del_rq = KroneckerDelta(r,q)
             del_rp = KroneckerDelta(r,p)
-            expr = _TWO*zpar[p]*zpar[q]*spec.lower[p,q] + (zpar[p]*zpar[p] + zpar[q]*zpar[q])*spec.raise_[p,q]
+            expr = _TWO*eta[p]*eta[q]*spec.lower[p,q] + (eta[p]*eta[p] + eta[q]*eta[q])*spec.raise_[p,q]
             expr = expr*sig[p,q]*(del_rq - del_rp)
 
             return _UNITY, expr
@@ -277,9 +277,9 @@ def _swap_agp(vec1: Vec, vec2: Vec, depth=None, *,spec: _AGPSpec):
                 del_ac = KroneckerDelta(a,c)
                 del_bd = KroneckerDelta(b,d)
                 exprn = del_ac*sig[d,b]*( \
-                        zpar[d]*( zpar[a]*zpar[a] - zpar[b]*zpar[b] )*spec.lower[b,d] + \
-                        zpar[b]*( zpar[a]*zpar[a] - zpar[d]*zpar[d] )*spec.raise_[b,d] \
-                        ) + del_ac*del_bd*( zpar[b]*zpar[b] - zpar[a]*zpar[a] )*spec.cartan[a]
+                        eta[d]*( eta[a]*eta[a] - eta[b]*eta[b] )*spec.lower[b,d] + \
+                        eta[b]*( eta[a]*eta[a] - eta[d]*eta[d] )*spec.raise_[b,d] \
+                        ) + del_ac*del_bd*( eta[b]*eta[b] - eta[a]*eta[a] )*spec.cartan[a]
                 return exprn
             expr1 = D_Ddag_comm_expr(p,q,r,s)
             expr2 = D_Ddag_comm_expr(q,p,s,r)
@@ -294,7 +294,7 @@ def _swap_agp(vec1: Vec, vec2: Vec, depth=None, *,spec: _AGPSpec):
             r = indice2[0]
             del_rq = KroneckerDelta(r,q)
             del_rp = KroneckerDelta(r,p)
-            expr = _TWO*zpar[p]*zpar[q]*spec.raise_[p,q] + (zpar[p]*zpar[p] + zpar[q]*zpar[q])*spec.lower[p,q]
+            expr = _TWO*eta[p]*eta[q]*spec.raise_[p,q] + (eta[p]*eta[p] + eta[q]*eta[q])*spec.lower[p,q]
             expr = expr*sig[p,q]*(del_rq - del_rp)
             
             return _UNITY, expr
