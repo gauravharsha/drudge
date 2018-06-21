@@ -3,7 +3,7 @@ Drudge for reduced AGP - PBCS Hamiltonian.
 """
 import collections, functools, operator
 
-from sympy import Integer, Symbol, IndexedBase, KroneckerDelta, factorial
+from sympy import Integer, Symbol, IndexedBase, KroneckerDelta, factorial, Function
 from sympy.utilities.iterables import (has_dups, default_sort_key)
 
 from drudge import Tensor
@@ -123,7 +123,7 @@ class ProjectedBCSDrudge(GenQuadDrudge):
         """Swapper for the new AGP Algebra."""
         return self._swapper
 
-    def get_vev(self,h_tsr: Tensor, Ntot: Symbol):
+    def get_vev(self,h_tsr: Tensor, N: Symbol):
         """Function to evaluate the expectation value of a normal
         ordered tensor 'h_tsr' with respect to the projected BCS
         ground state
@@ -132,18 +132,25 @@ class ProjectedBCSDrudge(GenQuadDrudge):
         """
         ctan = self.cartan
         eta = self.eta
+        fun = Function('f')
+        # fun = IndexedBase('f')
 
         def vev_of_term(term):
             """Return the VEV of a given term"""
             vecs = term.vecs
             t_amp = term.amp
+            ind_list = ()
             for i in vecs:
                 if i.base==ctan:
-                    t_amp = t_amp*eta[i.indices]*eta[i.indices]
+                    if i.indices in ind_list:
+                        continue
+                    else:
+                        t_amp = t_amp*eta[i.indices]*eta[i.indices]
+                        ind_list = ind_list + (i.indices,)
                 else:
                     return []
-            lk = len(vecs)
-            t_amp = t_amp*factorial(Ntot - lk)/factorial(Ntot)*(2**lk)
+            lk = len(ind_list)
+            t_amp = t_amp*fun(ind_list,N-lk)*(factorial(N)/factorial(N-lk))*(2**lk)
             return [Term(sums=term.sums, amp = t_amp, vecs=())]
         return h_tsr.bind(vev_of_term)
 
@@ -195,8 +202,8 @@ class ProjectedBCSDrudge(GenQuadDrudge):
 
         if isinstance(arg,Tensor):
             arg2 = arg
-            if final_step==True:
-                arg2 = arg.bind(p_no_cons)
+            # if final_step==True:
+            #     arg2 = arg.bind(p_no_cons)
             arg2 = arg2.bind(is_asym)
             return arg2.simplify(**kwargs)
         else:
