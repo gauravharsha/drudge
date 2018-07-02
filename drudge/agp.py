@@ -287,7 +287,7 @@ def _swap_agp(vec1: Vec, vec2: Vec, depth=None, *,spec: _AGPSpec):
                 exprn = del_ac*sig[d,b]*( \
                         eta[d]*( eta[a]*eta[a] - eta[b]*eta[b] )*spec.lower[b,d] + \
                         eta[b]*( eta[a]*eta[a] - eta[d]*eta[d] )*spec.raise_[b,d] \
-                        ) + del_ac*del_bd*( eta[b]*eta[b] - eta[a]*eta[a] )*spec.cartan[a]
+                        ) + del_ac*del_bd*( eta[b]*eta[b] - eta[a]*eta[a] )*spec.cartan[b]
                 return exprn
             expr1 = D_Ddag_comm_expr(p,q,r,s)
             expr2 = D_Ddag_comm_expr(q,p,s,r)

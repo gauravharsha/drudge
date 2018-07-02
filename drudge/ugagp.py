@@ -128,7 +128,7 @@ class ProjectedBCSDrudge(GenQuadDrudge):
                 raise ValueError('Unexpected generator of the AGP Algebra',v)
         return [Term(sums=term.sums, amp=term.amp, vecs=term.vecs)]
 
-    def get_vev(self,h_tsr: Tensor, N: Symbol):
+    def get_vev(self,h_tsr: Tensor):
         """Function to evaluate the expectation value of a normal
         ordered tensor 'h_tsr' with respect to the projected BCS
         ground state
@@ -137,25 +137,26 @@ class ProjectedBCSDrudge(GenQuadDrudge):
         """
         ctan = self.cartan
         eta = self.eta
-        fun = Function('f')
+        gam = IndexedBase(r'\gamma')
 
         def vev_of_term(term):
             """Return the VEV of a given term"""
             vecs = term.vecs
             t_amp = term.amp
-            ind_list = ()
+            ind_list = []
             for i in vecs:
                 if i.base==ctan:
                     if i.indices in ind_list:
                         continue
                     else:
-                        t_amp = t_amp*eta[i.indices]*eta[i.indices]
-                        ind_list = ind_list + (i.indices,)
+                        # t_amp = t_amp*eta[i.indices]*eta[i.indices]
+                        ind_list = ind_list + [i.indices,]
                 else:
                     return []
+            if ind_list:
+                t_amp = t_amp*gam[ind_list[:]]
             lk = len(vecs)
-            lind = len(ind_list)
-            t_amp = t_amp*fun(ind_list,N-lind)*(factorial(N)/factorial(N-lind))*(2**lk)
+            t_amp = t_amp*(2**lk)
             return [Term(sums=term.sums, amp = t_amp, vecs=())]
         return h_tsr.bind(vev_of_term)
 
@@ -410,17 +411,16 @@ class UnitaryGroupDrudge(GenQuadDrudge):
             tensor.subst_all(self._agp2uga_defs).terms
         )
 
-    def get_vev_agp(self,h_tsr: Tensor, Ntot: Symbol):
+    def get_vev_agp(self,h_tsr: Tensor,):
         """Function to evaluate the expectation value of a normal
         ordered tensor 'h_tsr' with respect to the projected BCS
         or the AGP state. This can be done after translating the the
         unitary group terms into the AGP basis algebra.
             h_tsr = tensor whose VEV is to be evaluated
-            Ntot = total number of orbitals available
         """
         transled = self._transl2agp(h_tsr)
         transled = self._agp_dr.agp_simplify(transled,final_step=True)
-        res = self._agp_dr.get_vev(transled,Ntot)
+        res = self._agp_dr.get_vev(transled)
         return Tensor(self, res.terms)
 
 
