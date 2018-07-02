@@ -101,8 +101,8 @@ class ProjectedBCSDrudge(GenQuadDrudge):
             cartan.label[0]+'_':cartan,
             raise_.label[0]+'_p':raise_,
             lower.label[0]+'_m':lower,
-            'sig':sig,
-            'eta':eta
+            'sig':self.sig,
+            'eta':self.eta
         })
 
         self.set_name(cartan, lower, Ddag=raise_)
@@ -149,8 +149,9 @@ class ProjectedBCSDrudge(GenQuadDrudge):
                         ind_list = ind_list + (i.indices,)
                 else:
                     return []
-            lk = len(ind_list)
-            t_amp = t_amp*fun(ind_list,N-lk)*(factorial(N)/factorial(N-lk))*(2**lk)
+            lk = len(vecs)
+            lind = len(ind_list)
+            t_amp = t_amp*fun(ind_list,N-lind)*(factorial(N)/factorial(N-lind))*(2**lk)
             return [Term(sums=term.sums, amp = t_amp, vecs=())]
         return h_tsr.bind(vev_of_term)
 
